@@ -1,0 +1,152 @@
+{
+  "l1_tools": [
+    {"name": "leer_inventario", "description": "Read or query inventory data. Use for: checking stock, consulting, auditing, investigating, listing products.", "parameters": {}},
+    {"name": "modificar_inventario", "description": "Modify inventory data. Use for: adding, removing, inserting, deleting, putting products in or out.", "parameters": {}}
+  ],
+  "l2_read": [
+    {"name": "consultar_inventario", "description": "Check stock levels, list products, or query how much of something is available.", "parameters": {}},
+    {"name": "investigar_sospechosos", "description": "Audit inventory, find errors, investigate suspicious or flagged movements.", "parameters": {}}
+  ],
+  "l2_write": [
+    {"name": "agregar_inventario", "description": "Add, put in, or increase product stock quantity.", "parameters": {}},
+    {"name": "remover_inventario", "description": "Remove, take out, subtract, or decrease product stock quantity.", "parameters": {}}
+  ],
+  "l3_args": {
+    "agregar_inventario": {
+      "name": "agregar_inventario",
+      "description": "Add a product quantity to inventory.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": true},
+        "cantidad": {"type": "integer", "description": "Quantity to add.", "required": true}
+      }
+    },
+    "remover_inventario": {
+      "name": "remover_inventario",
+      "description": "Remove a product quantity from inventory.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": true},
+        "cantidad": {"type": "integer", "description": "Quantity to remove.", "required": true}
+      }
+    },
+    "consultar_inventario": {
+      "name": "consultar_inventario",
+      "description": "Check current inventory stock.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": false}
+      }
+    },
+    "investigar_sospechosos": {
+      "name": "investigar_sospechosos",
+      "description": "Find suspicious inventory movements.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": false}
+      }
+    },
+    "confirmar_movimiento": {
+      "name": "confirmar_movimiento",
+      "description": "Confirm or reject an inventory movement.",
+      "parameters": {
+        "movimiento_id": {"type": "integer", "description": "Movement id.", "required": true},
+        "confirmar": {"type": "boolean", "description": "Whether to confirm.", "required": true}
+      }
+    }
+  },
+  "tools_needle": [
+    {
+      "name": "agregar_inventario",
+      "description": "Add a product quantity to inventory.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": true},
+        "cantidad": {"type": "integer", "description": "Quantity to add.", "required": true}
+      }
+    },
+    {
+      "name": "remover_inventario",
+      "description": "Remove a product quantity from inventory.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": true},
+        "cantidad": {"type": "integer", "description": "Quantity to remove.", "required": true}
+      }
+    },
+    {
+      "name": "consultar_inventario",
+      "description": "Check current inventory stock.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": false}
+      }
+    },
+    {
+      "name": "investigar_sospechosos",
+      "description": "Find suspicious inventory movements.",
+      "parameters": {
+        "producto": {"type": "string", "description": "Product name.", "required": false}
+      }
+    },
+    {
+      "name": "confirmar_movimiento",
+      "description": "Confirm or reject an inventory movement.",
+      "parameters": {
+        "movimiento_id": {"type": "integer", "description": "Movement id.", "required": true},
+        "confirmar": {"type": "boolean", "description": "Confirm status.", "required": true}
+      }
+    }
+  ],
+  "tools": [
+    {
+      "name": "agregar_inventario",
+      "description": "Agrega una cantidad de un producto al inventario.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "producto": {"type": "string", "description": "Nombre del producto"},
+          "cantidad": {"type": "integer", "description": "Cantidad"}
+        },
+        "required": ["producto", "cantidad"]
+      }
+    },
+    {
+      "name": "remover_inventario",
+      "description": "Remueve una cantidad de un producto del inventario.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "producto": {"type": "string", "description": "Nombre del producto"},
+          "cantidad": {"type": "integer", "description": "Cantidad"}
+        },
+        "required": ["producto", "cantidad"]
+      }
+    },
+    {
+      "name": "consultar_inventario",
+      "description": "Consulta el stock actual.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "producto": {"type": "string", "description": "Nombre del producto (opcional)"}
+        }
+      }
+    },
+    {
+      "name": "investigar_sospechosos",
+      "description": "Investiga movimientos sospechosos.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "producto": {"type": "string", "description": "Nombre del producto (opcional)"}
+        }
+      }
+    },
+    {
+      "name": "confirmar_movimiento",
+      "description": "Confirma o rechaza un movimiento.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "movimiento_id": {"type": "integer", "description": "ID del movimiento"},
+          "confirmar": {"type": "boolean", "description": "Confirmar o rechazar"}
+        },
+        "required": ["movimiento_id", "confirmar"]
+      }
+    }
+  ]
+}

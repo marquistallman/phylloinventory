@@ -1,0 +1,35 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: cactus_inventario_db
+    environment:
+      POSTGRES_DB: inventario
+      POSTGRES_USER: cactus
+      POSTGRES_PASSWORD: cactus
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U cactus -d inventario"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  needle:
+    build:
+      context: .
+      dockerfile: Dockerfile.needle
+    container_name: cactus_needle_server
+    ports:
+      - "8081:8081"
+    volumes:
+      - needle_checkpoints:/app/checkpoints
+    environment:
+      - CHECKPOINT_PATH=/app/checkpoints/needle.pkl
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  needle_checkpoints:
