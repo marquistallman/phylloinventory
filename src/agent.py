@@ -73,6 +73,29 @@ def _extract_producto(query: str) -> str | None:
     return None
 
 
+_CONFIRMA_RE = re.compile(
+    r"\b(si|sí|dale|confirma\w*|ok|okay|yes|acepta\w*|va|hazlo|metele|adelante)\b",
+    re.IGNORECASE,
+)
+_RECHAZA_RE = re.compile(
+    r"\b(no\b(?!\s+(s[ée]|estoy|creo)\b)|nope|negativo|rechaza\w*|cancela\w*|descarta\w*|anula\w*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_confirmacion(text: str) -> bool | None:
+    """Detecta si el usuario confirma (True) o rechaza (False).
+
+    None si no hay una intencion clara. Gana la palabra que aparece primero.
+    """
+    matches = [(m.start(), True) for m in _CONFIRMA_RE.finditer(text)]
+    matches += [(m.start(), False) for m in _RECHAZA_RE.finditer(text)]
+    if not matches:
+        return None
+    matches.sort()
+    return matches[0][1]
+
+
 def _normalize_args(name: str, args: dict, query: str) -> dict:
     if name in ("agregar_inventario", "remover_inventario"):
         prod = _normalize_producto(str(args.get("producto", "")))
@@ -80,7 +103,8 @@ def _normalize_args(name: str, args: dict, query: str) -> dict:
         if not prod or prod in NO_PRODUCTO:
             prod = _extract_producto(query)
         if not cant:
-            cant = int(re.search(r"(\d+)", query).group(1)) if re.search(r"(\d+)", query) else 0
+            nums = re.findall(r"(\d+)", query)
+            cant = int(nums[-1]) if nums else 0
         return {"producto": prod or "", "cantidad": cant or 0}
 
     if name in ("consultar_inventario", "investigar_sospechosos"):
@@ -136,20 +160,32 @@ class NeedleHTTPAgent:
         full_raw = []
 
         if pending_alert:
-            ctx = (f"Hay una alerta de inventario pendiente (ID {pending_alert['movimiento_id']}, "
+            mid = pending_alert["movimiento_id"]
+
+            # 1) Via determinista: un si/no no deberia depender de un modelo de 26M
+            conf = _parse_confirmacion(query)
+            if conf is not None:
+                full_raw.append(f"regex:confirmar={conf}")
+                return [{"name": "confirmar_movimiento",
+                         "arguments": {"movimiento_id": mid, "confirmar": conf}}], " | ".join(full_raw)
+
+            # 2) Needle solo con el schema de confirmar
+            ctx = (f"Hay una alerta de inventario pendiente (ID {mid}, "
                    f"producto {pending_alert['producto']}, {pending_alert['cantidad']} unidades). "
                    f"El usuario dice: {query}")
             schema = self._l3.get("confirmar_movimiento")
             if schema:
                 c3, r3 = self._infer_raw(ctx, [schema])
                 full_raw.append(r3)
-                if c3:
-                    tc = c3[0]
+                for tc in c3:
                     if tc["name"] == "confirmar_movimiento":
                         args = _normalize_args("confirmar_movimiento", tc["arguments"], ctx)
-                        if args.get("movimiento_id", 0) > 0:
-                            return [{"name": "confirmar_movimiento", "arguments": args}], " | ".join(full_raw)
-            query = ctx
+                        args["movimiento_id"] = mid  # el ID real es el del estado local
+                        return [{"name": "confirmar_movimiento", "arguments": args}], " | ".join(full_raw)
+
+            # 3) Con alerta pendiente NUNCA se cae al pipeline generico:
+            #    el contexto de la alerta dispararia escrituras fantasma.
+            return [], " | ".join(full_raw)
 
         first_result = self._pipeline(query, list(self._l1), full_raw)
         if first_result and not self._is_suspicious(query, first_result):

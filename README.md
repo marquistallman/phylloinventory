@@ -71,6 +71,26 @@ python -m src.cli
   MAYOR SOSPECHOSO: #2 | papa entrada 200 | 75.7s
 ```
 
+## Entrada de voz (local, español)
+
+La CLI acepta dictado por microfono con **faster-whisper** (100% local, corre
+en CPU, sin API keys):
+
+```bash
+pip install faster-whisper sounddevice
+```
+
+```
+📝 > voz
+  🎤 Grabando... presiona Enter para detener
+  Escuchado: agrega 4 papas
+  🔧 [agregar_inventario] {"producto": "papa", "cantidad": 4}
+  V Movimiento ACEPTADO por Kalman. papa: 50 -> 54
+```
+
+El modelo `small` (~460 MB) se descarga de HuggingFace la primera vez. Sin
+estas dependencias la CLI sigue funcionando en modo texto.
+
 ## Modo de emergencia (sin Needle)
 
 Si Needle no esta disponible, puedes usar el parser regex:
@@ -90,6 +110,7 @@ storage/
 ├── src/
 │   ├── cli.py                 # CLI interactiva (Rich)
 │   ├── agent.py               # NeedleHTTPAgent + CactusAgent + fallback
+│   ├── voice.py               # WhisperListener — STT local (faster-whisper, español)
 │   ├── tool_server.py         # FastAPI tool server (:8000)
 │   ├── tools.json             # Definiciones de tools
 │   └── db_client.py           # Cliente PostgreSQL

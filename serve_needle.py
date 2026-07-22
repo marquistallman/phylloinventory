@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import logging
 
 from fastapi import FastAPI, HTTPException
@@ -54,7 +55,46 @@ class InferRequest(BaseModel):
 
 class ToolCall(BaseModel):
     name: str
-    arguments: dict
+    arguments: dict = {}
+
+
+def _parse_tool_calls(raw: str) -> list[ToolCall]:
+    """Parsea tool calls tolerando salida truncada o duplicada del modelo.
+
+    Needle (26M) a veces corta el JSON a mitad o repite la misma call dos
+    veces. En vez de descartar todo, se rescata el primer JSON completo.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+
+    objs = []
+    try:
+        parsed = json.loads(raw)
+        objs = parsed if isinstance(parsed, list) else [parsed]
+    except json.JSONDecodeError:
+        decoder = json.JSONDecoder()
+        for m in re.finditer(r"[\[{]", raw):
+            try:
+                obj, _ = decoder.raw_decode(raw, m.start())
+            except json.JSONDecodeError:
+                continue
+            objs = obj if isinstance(obj, list) else [obj]
+            break
+
+    calls, seen = [], set()
+    for o in objs:
+        if not isinstance(o, dict) or "name" not in o:
+            continue
+        args = o.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        key = json.dumps([o["name"], args], sort_keys=True, default=str)
+        if key in seen:
+            continue
+        seen.add(key)
+        calls.append(ToolCall(name=str(o["name"]), arguments=args))
+    return calls
 
 
 class InferResponse(BaseModel):
@@ -81,15 +121,10 @@ def infer(req: InferRequest):
         logger.exception("Generate failed")
         raise HTTPException(500, str(e))
 
-    tool_calls = []
-    try:
-        parsed = json.loads(result) if isinstance(result, str) else result
-        if isinstance(parsed, list):
-            tool_calls = [ToolCall(**tc) for tc in parsed]
-        elif isinstance(parsed, dict):
-            tool_calls = [ToolCall(**parsed)]
-    except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning("Could not parse tool calls from: %s", result[:200])
+    raw = result if isinstance(result, str) else json.dumps(result, default=str)
+    tool_calls = _parse_tool_calls(raw)
+    if not tool_calls and raw.strip():
+        logger.warning("Could not parse tool calls from: %s", raw[:200])
 
     logger.info("Tool calls: %s", [(tc.name, tc.arguments) for tc in tool_calls])
     return InferResponse(tool_calls=tool_calls, raw_output=str(result))

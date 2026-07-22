@@ -16,6 +16,7 @@ from rich.status import Status
 from rich import box
 
 from .agent import NeedleHTTPAgent, execute_tools, call_tool, parse_intent_fallback
+from .voice import WhisperListener
 from . import db_client as db
 
 console = Console()
@@ -65,6 +66,7 @@ class InventoryDemo:
     def __init__(self, use_fallback: bool = False):
         self.use_fallback = use_fallback
         self.agent: Optional[NeedleHTTPAgent] = None
+        self.voice = WhisperListener()
         self.tools_path = os.path.join(os.path.dirname(__file__), "tools.json")
         self.last_sospechoso: Optional[dict] = None
 
@@ -110,6 +112,7 @@ class InventoryDemo:
                     "  'hay algo raro, investiga' → auditar sospechosos\n"
                     "  'si / dale / confirma'     → confirmar alerta\n"
                     "  'no / rechaza'             → rechazar alerta\n"
+                    "  voz / hablar               → dictar por microfono 🎤\n"
                     "  salir / exit               → cerrar\n"
                 ),
                 vertical="middle",
@@ -181,6 +184,11 @@ class InventoryDemo:
                 self._check_db()
                 continue
 
+            if low in ("voz", "hablar", "v", "mic", "microfono"):
+                self._handle_voice()
+                console.print()
+                continue
+
             try:
                 if self.use_fallback:
                     self._handle_fallback(user_input)
@@ -209,6 +217,7 @@ class InventoryDemo:
         if not tool_calls:
             console.print(f"  [dim]Needle raw: {raw_output[:120]}[/dim]")
             if self.last_sospechoso:
+                # NO limpiar last_sospechoso: la alerta sigue viva en la BD
                 console.print(
                     "[yellow]Needle no detecto una accion. Tienes una alerta pendiente:[/yellow]"
                 )
@@ -219,7 +228,6 @@ class InventoryDemo:
                     "[yellow]Needle no detecto ninguna accion. Prueba con:[/yellow]\n"
                     "  [cyan]'agrega 4 papas'[/cyan]   [cyan]'saca 3 cebollas'[/cyan]   [cyan]'cuanto hay de tomate'[/cyan]"
                 )
-            self.last_sospechoso = None
             return
 
         if raw_output:
@@ -233,6 +241,36 @@ class InventoryDemo:
 
         for result in results:
             self._display_result(result)
+
+    def _handle_voice(self):
+        if not self.voice.available():
+            console.print(
+                "[red]Faltan las dependencias de voz.[/red]\n"
+                "  [cyan]pip install faster-whisper sounddevice[/cyan]"
+            )
+            return
+
+        try:
+            with Status("[dim]Cargando Whisper (local, español)...[/dim]", console=console):
+                self.voice.load()
+            console.print("[bold magenta]🎤 Grabando... presiona Enter para detener[/bold magenta]")
+            text = self.voice.listen()
+        except Exception as e:
+            console.print(f"[red]Error de microfono/Whisper: {e}[/red]")
+            return
+
+        if not text:
+            console.print("[yellow]No se escucho nada util. Intenta de nuevo.[/yellow]")
+            return
+
+        console.print(f"  [dim]Escuchado:[/dim] [bold magenta]{text}[/bold magenta]")
+        try:
+            if self.use_fallback:
+                self._handle_fallback(text)
+            else:
+                self._handle_needle(text)
+        except Exception as e:
+            console.print(f"[red]Error: {e}[/red]")
 
     def _handle_fallback(self, text: str):
         calls = parse_intent_fallback(text)
