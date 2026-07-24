@@ -1,7 +1,32 @@
+# =====================================================================
+#  Cactus Inventory — Microservicios
+#
+#  Perfiles:
+#    default (sin profile) -> postgres, kalman-worker, needle-service, api-gateway
+#    --profile with-voice      -> agrega voice-service
+#    --profile with-openrouter -> agrega openrouter-service y lo selecciona como backend
+#
+#  Uso:
+#    docker compose up -d                              # minimo (needle)
+#    docker compose --profile with-voice up -d         # + voz
+#    docker compose --profile with-openrouter --profile with-voice up -d  # todo
+#
+#  LLM_BACKEND=needle|openrouter cambia el backend por env (default needle)
+# =====================================================================
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
+  # -------------------------------------------------------------------
+  #  PostgreSQL — DB + cola pending_evaluations + funciones puras
+  # -------------------------------------------------------------------
   postgres:
     image: postgres:16
-    container_name: cactus_inventario_db
+    container_name: cactus_postgres
     environment:
       POSTGRES_DB: inventario
       POSTGRES_USER: cactus
@@ -15,21 +40,130 @@ services:
       test: ["CMD-SHELL", "pg_isready -U cactus -d inventario"]
       interval: 5s
       timeout: 3s
-      retries: 5
+      retries: 10
+    networks:
+      - cactus_net
+    logging: *default-logging
 
-  needle:
+  # -------------------------------------------------------------------
+  #  kalman-worker (Go) — consume la cola y evalua Kalman
+  # -------------------------------------------------------------------
+  kalman-worker:
+    build:
+      context: ./kalman-worker
+      dockerfile: Dockerfile
+    container_name: cactus_kalman_worker
+    environment:
+      DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
+      KALMAN_WORKERS: "8"                # goroutines worker (sobra para demo)
+      POLL_INTERVAL: "200ms"
+      HTTP_ADDR: ":8300"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8300:8300"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  needle-service — modelo 26M on-device
+  # -------------------------------------------------------------------
+  needle-service:
     build:
       context: .
-      dockerfile: Dockerfile.needle
-    container_name: cactus_needle_server
-    ports:
-      - "8081:8081"
+      dockerfile: services/needle_svc/Dockerfile
+    container_name: cactus_needle
+    environment:
+      DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
+      CHECKPOINT_PATH: /app/checkpoints/needle.pkl
+      MAX_INFER_INFLIGHT: "4"
+      UVICORN_WORKERS: "1"
     volumes:
       - needle_checkpoints:/app/checkpoints
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  openrouter-service — backend alternativo (perfil with-openrouter)
+  # -------------------------------------------------------------------
+  openrouter-service:
+    profiles: ["with-openrouter"]
+    build:
+      context: .
+      dockerfile: services/openrouter/Dockerfile
+    container_name: cactus_openrouter
     environment:
-      - CHECKPOINT_PATH=/app/checkpoints/needle.pkl
-    restart: unless-stopped
+      DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE: ${OPENROUTER_BASE:-https://openrouter.ai/api/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-3.5-haiku}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8082:8082"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  api-gateway — punto de entrada para la CLI
+  # -------------------------------------------------------------------
+  api-gateway:
+    build:
+      context: .
+      dockerfile: services/api-gateway/Dockerfile
+    container_name: cactus_api_gateway
+    environment:
+      DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
+      LLM_BACKEND: ${LLM_BACKEND:-needle}
+      NEEDLE_URL: http://needle-service:8081
+      OPENROUTER_URL: http://openrouter-service:8082
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kalman-worker:
+        condition: service_started
+      needle-service:
+        condition: service_started
+    ports:
+      - "8200:8200"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  voice-service — WebSocket STT (perfil with-voice)
+  # -------------------------------------------------------------------
+  voice-service:
+    profiles: ["with-voice"]
+    build:
+      context: .
+      dockerfile: services/voice/Dockerfile
+    container_name: cactus_voice
+    environment:
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_LANGUAGE: es
+      VOICE_SILENCE_RMS: "0.01"
+      VOICE_SILENCE_SECS: "0.8"
+    ports:
+      - "8100:8100"
+    networks:
+      - cactus_net
+    logging: *default-logging
 
 volumes:
   pgdata:
   needle_checkpoints:
+
+networks:
+  cactus_net:
+    driver: bridge
