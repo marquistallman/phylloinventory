@@ -18,18 +18,20 @@ L2_WRITE = [
 L3_ARGS = {
     "agregar_inventario": {
         "name": "agregar_inventario",
-        "description": "Add a product quantity to inventory.",
+        "description": "Add a product quantity to inventory. The user may specify a unit (kilos, litros, unidades, gramos, mililitros).",
         "parameters": {
             "producto": {"type": "string", "description": "Product name.", "required": True},
-            "cantidad": {"type": "integer", "description": "Quantity to add.", "required": True},
+            "cantidad": {"type": "number", "description": "Quantity to add (can be decimal, e.g. 0.5, 1.25).", "required": True},
+            "unidad": {"type": "string", "description": "Unit mentioned by user: kilos, kilogramos, kg, gramos, gr, litros, lts, ml, unidades, unds, cajas, paquetes, sobres, etc.", "required": False},
         },
     },
     "remover_inventario": {
         "name": "remover_inventario",
-        "description": "Remove a product quantity from inventory.",
+        "description": "Remove a product quantity from inventory. The user may specify a unit.",
         "parameters": {
             "producto": {"type": "string", "description": "Product name.", "required": True},
-            "cantidad": {"type": "integer", "description": "Quantity to remove.", "required": True},
+            "cantidad": {"type": "number", "description": "Quantity to remove (can be decimal).", "required": True},
+            "unidad": {"type": "string", "description": "Unit mentioned by user.", "required": False},
         },
     },
     "consultar_inventario": {
@@ -57,12 +59,13 @@ TOOLS_OPENAI = [
         "type": "function",
         "function": {
             "name": "agregar_inventario",
-            "description": "Agrega una cantidad de un producto al inventario.",
+            "description": "Agrega una cantidad de un producto al inventario. El usuario puede mencionar unidad (kilos, litros, gramos, mililitros, unidades, cajas).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "producto": {"type": "string", "description": "Nombre del producto"},
-                    "cantidad": {"type": "integer", "description": "Cantidad"},
+                    "cantidad": {"type": "number", "description": "Cantidad (puede ser decimal: 0.5, 1.25)"},
+                    "unidad": {"type": "string", "description": "Unidad mencionada: kilos, kg, gramos, g, litros, lts, ml, unidades, unds, cajas, paquetes"},
                 },
                 "required": ["producto", "cantidad"],
             },
@@ -77,7 +80,8 @@ TOOLS_OPENAI = [
                 "type": "object",
                 "properties": {
                     "producto": {"type": "string", "description": "Nombre del producto"},
-                    "cantidad": {"type": "integer", "description": "Cantidad"},
+                    "cantidad": {"type": "number", "description": "Cantidad (puede ser decimal)"},
+                    "unidad": {"type": "string", "description": "Unidad mencionada por el usuario"},
                 },
                 "required": ["producto", "cantidad"],
             },

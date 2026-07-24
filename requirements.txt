@@ -10,3 +10,7 @@ sounddevice>=0.4
 
 # UI
 rich>=13.0
+
+# Importador de catalogo Excel (local, no en Docker)
+openpyxl>=3.1
+psycopg2-binary>=2.9
