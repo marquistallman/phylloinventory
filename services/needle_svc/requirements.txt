@@ -2,5 +2,6 @@ fastapi>=0.109
 uvicorn[standard]>=0.27
 asyncpg>=0.29
 huggingface-hub>=0.20
+rapidfuzz>=3.0
 #  El paquete "needle" de cactus-compute se instala aparte en el Dockerfile
 #  para evitar shadowing con este modulo.

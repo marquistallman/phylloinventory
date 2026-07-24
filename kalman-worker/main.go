@@ -78,7 +78,7 @@ type Pending struct {
 	ToolName    string
 	ProductoID  int32
 	Tipo        string
-	Cantidad    int32
+	Cantidad    float64
 	Payload     []byte
 }
 
@@ -92,7 +92,7 @@ type KalmanResult struct {
 	Umbral          float64 `json:"umbral"`
 	MediaActual     float64 `json:"media_actual"`
 	VarianzaActual  float64 `json:"varianza_actual"`
-	StockProyectado int32   `json:"stock_proyectado"`
+	StockProyectado float64 `json:"stock_proyectado"`
 	PuntajeRiesgo   float64 `json:"puntaje_riesgo"`
 }
 
@@ -356,6 +356,12 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 			return err
 		}
 
+		//  Sincronizar registros_conteo
+		_, _ = tx.Exec(wp.ctx, `
+			UPDATE registros_conteo SET decision_kalman='ACEPTADA', movimiento_id=$1
+			WHERE pending_id=$2
+		`, movID, p.ID)
+
 		//  Auditoria: log para investigar_sospechosos
 		_, _ = tx.Exec(wp.ctx, `
 			INSERT INTO auditoria_log (movimiento_id, puntaje_riesgo, motivo)
@@ -375,6 +381,11 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 		if err != nil {
 			return err
 		}
+		//  Sincronizar registros_conteo
+		_, _ = tx.Exec(wp.ctx, `
+			UPDATE registros_conteo SET decision_kalman='SOSPECHOSA'
+			WHERE pending_id=$1
+		`, p.ID)
 		wp.incStat(&wp.suspicious)
 		log.Printf("[pending %d] SOSPECHOSA — esperando confirmacion humana", p.ID)
 
@@ -434,8 +445,17 @@ func (wp *WorkerPool) evalConfirmacion(tx pgx.Tx, p Pending) error {
 
 	if args.Confirmar {
 		wp.incStat(&wp.confirmed)
+		//  Sincronizar registros_conteo del pending original
+		_, _ = tx.Exec(wp.ctx, `
+			UPDATE registros_conteo SET decision_kalman='CONFIRMADA_MANUAL'
+			WHERE pending_id=$1
+		`, args.PendingID)
 	} else {
 		wp.incStat(&wp.rejected)
+		_, _ = tx.Exec(wp.ctx, `
+			UPDATE registros_conteo SET decision_kalman='RECHAZADA'
+			WHERE pending_id=$1
+		`, args.PendingID)
 	}
 	log.Printf("[pending %d] confirm resolved: %s", p.ID, result)
 

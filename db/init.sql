@@ -4,29 +4,44 @@
 --  La DB expone solo funciones puras y una tabla-cola.
 -- =====================================================================
 
+-- =====================================================================
+--  Bodegas (ubicaciones fisicas del inventario)
+-- =====================================================================
+CREATE TABLE bodegas (
+    id          SERIAL PRIMARY KEY,
+    nombre      VARCHAR(150) UNIQUE NOT NULL,
+    creado_en   TIMESTAMP DEFAULT NOW()
+);
+
+INSERT INTO bodegas (nombre) VALUES ('bodega_default');
+
 CREATE TABLE productos (
     id              SERIAL PRIMARY KEY,
-    nombre          VARCHAR(100) UNIQUE NOT NULL,
-    stock_actual    INTEGER NOT NULL DEFAULT 0,
+    nombre          VARCHAR(150) NOT NULL,
+    bodega_id       INTEGER NOT NULL REFERENCES bodegas(id) DEFAULT 1,
+    codigo_articulo VARCHAR(20),
+    unidad          VARCHAR(20) NOT NULL DEFAULT 'Unidad',
+    stock_actual    FLOAT NOT NULL DEFAULT 0,
     media_kalman    FLOAT NOT NULL DEFAULT 0,
     varianza_kalman FLOAT NOT NULL DEFAULT 100.0,
     q_proceso       FLOAT NOT NULL DEFAULT 5.0,
     r_medicion      FLOAT NOT NULL DEFAULT 1.0,
     umbral_sigma    FLOAT NOT NULL DEFAULT 2.0,
     creado_en       TIMESTAMP DEFAULT NOW(),
-    actualizado_en  TIMESTAMP DEFAULT NOW()
+    actualizado_en  TIMESTAMP DEFAULT NOW(),
+    UNIQUE (nombre, bodega_id)
 );
 
 CREATE TABLE inventario_movimientos (
     id                   SERIAL PRIMARY KEY,
     producto_id          INTEGER NOT NULL REFERENCES productos(id),
     tipo                 VARCHAR(10) NOT NULL CHECK (tipo IN ('entrada', 'salida')),
-    cantidad_reportada   INTEGER NOT NULL CHECK (cantidad_reportada > 0),
+    cantidad_reportada   FLOAT NOT NULL CHECK (cantidad_reportada > 0),
     residual_kalman      FLOAT,
     decision_kalman      VARCHAR(20) NOT NULL DEFAULT 'PENDIENTE'
         CHECK (decision_kalman IN ('ACEPTADA', 'SOSPECHOSA', 'RECHAZADA', 'CONFIRMADA_MANUAL')),
     umbral_usado         FLOAT,
-    stock_resultante     INTEGER,
+    stock_resultante     FLOAT,
     creado_en            TIMESTAMP DEFAULT NOW()
 );
 
@@ -49,7 +64,7 @@ CREATE TABLE pending_evaluations (
     tool_name      VARCHAR(50) NOT NULL,
     producto_id    INTEGER REFERENCES productos(id),
     tipo           VARCHAR(10),
-    cantidad       INTEGER,
+    cantidad       FLOAT,
     payload        JSONB,
     status         VARCHAR(20) NOT NULL DEFAULT 'PENDING'
         CHECK (status IN ('PENDING', 'ACEPTADA', 'SOSPECHOSA', 'CONFIRMADA_MANUAL', 'RECHAZADA')),
@@ -67,14 +82,41 @@ CREATE INDEX idx_pending_status ON pending_evaluations (status) WHERE status = '
 CREATE INDEX idx_pending_session ON pending_evaluations (session_id);
 
 -- =====================================================================
+--  Sesiones y registros de conteo
+-- =====================================================================
+CREATE TABLE sesiones_conteo (
+    id              SERIAL PRIMARY KEY,
+    bodega_id       INTEGER NOT NULL REFERENCES bodegas(id),
+    estado          VARCHAR(20) NOT NULL DEFAULT 'activa'
+        CHECK (estado IN ('activa', 'finalizada', 'cancelada')),
+    iniciada_por    VARCHAR(100) DEFAULT 'anonimo',
+    creado_en       TIMESTAMP DEFAULT NOW(),
+    finalizado_en   TIMESTAMP
+);
+
+CREATE TABLE registros_conteo (
+    id                    SERIAL PRIMARY KEY,
+    sesion_id             INTEGER NOT NULL REFERENCES sesiones_conteo(id),
+    producto_id           INTEGER NOT NULL REFERENCES productos(id),
+    cantidad_contada      FLOAT NOT NULL,
+    unidad_usada          VARCHAR(20) NOT NULL,
+    cantidad_normalizada  FLOAT NOT NULL,
+    stock_sistema         FLOAT NOT NULL,
+    decision_kalman       VARCHAR(20) NOT NULL DEFAULT 'PENDIENTE',
+    movimiento_id         INTEGER REFERENCES inventario_movimientos(id),
+    pending_id            BIGINT REFERENCES pending_evaluations(id),
+    creado_en             TIMESTAMP DEFAULT NOW()
+);
+
+-- =====================================================================
 --  Seed
 -- =====================================================================
-INSERT INTO productos (nombre, stock_actual, media_kalman, varianza_kalman) VALUES
-    ('papa', 50, 50, 100.0),
-    ('cebolla', 30, 30, 100.0),
-    ('tomate', 25, 25, 100.0),
-    ('zanahoria', 40, 40, 100.0),
-    ('ajo', 15, 15, 100.0);
+INSERT INTO productos (nombre, bodega_id, unidad, stock_actual, media_kalman, varianza_kalman) VALUES
+    ('papa', 1, 'Kilogram', 50, 50, 100.0),
+    ('cebolla', 1, 'Kilogram', 30, 30, 100.0),
+    ('tomate', 1, 'Kilogram', 25, 25, 100.0),
+    ('zanahoria', 1, 'Kilogram', 40, 40, 100.0),
+    ('ajo', 1, 'Kilogram', 15, 15, 100.0);
 
 -- =====================================================================
 --  kalman_evaluar() — FUNCION PURA
@@ -84,14 +126,14 @@ INSERT INTO productos (nombre, stock_actual, media_kalman, varianza_kalman) VALU
 CREATE OR REPLACE FUNCTION kalman_evaluar(
     p_producto_id INTEGER,
     p_tipo        VARCHAR,
-    p_cantidad    INTEGER
+    p_cantidad    FLOAT
 ) RETURNS TABLE (
     decision          TEXT,
     residual          FLOAT,
     umbral            FLOAT,
     media_actual      FLOAT,
     varianza_actual   FLOAT,
-    stock_proyectado  INTEGER,
+    stock_proyectado  FLOAT,
     puntaje_riesgo    FLOAT
 ) AS $$
 DECLARE
@@ -100,7 +142,7 @@ DECLARE
     s_innov       FLOAT;
     sigma_umbral  FLOAT;
     residual_v    FLOAT;
-    nuevo_stock   INTEGER;
+    nuevo_stock   FLOAT;
 BEGIN
     SELECT * INTO prod FROM productos WHERE id = p_producto_id;
     IF NOT FOUND THEN
@@ -153,7 +195,7 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION aplicar_movimiento_aceptado(
     p_producto_id INTEGER,
     p_tipo        VARCHAR,
-    p_cantidad    INTEGER,
+    p_cantidad    FLOAT,
     p_residual    FLOAT,
     p_umbral      FLOAT
 ) RETURNS INTEGER AS $$
@@ -162,7 +204,7 @@ DECLARE
     p_pred      FLOAT;
     s_innov     FLOAT;
     k_ganancia  FLOAT;
-    nuevo_stock INTEGER;
+    nuevo_stock FLOAT;
     new_id      INTEGER;
 BEGIN
     SELECT * INTO prod FROM productos WHERE id = p_producto_id FOR UPDATE;
@@ -207,7 +249,7 @@ CREATE OR REPLACE FUNCTION investigar_sospechosos(p_producto_nombre VARCHAR DEFA
 RETURNS TABLE(
     movimiento_id        INTEGER,
     producto_nombre      VARCHAR,
-    cantidad_reportada   INTEGER,
+    cantidad_reportada   FLOAT,
     tipo                 VARCHAR,
     residual             FLOAT,
     puntaje_riesgo       FLOAT,
@@ -249,7 +291,7 @@ DECLARE
     p_pred  FLOAT;
     s_innov FLOAT;
     k_gan  FLOAT;
-    ns      INTEGER;
+    ns      FLOAT;
 BEGIN
     SELECT * INTO pend FROM pending_evaluations WHERE id = p_pending_id FOR UPDATE;
     IF pend IS NULL THEN
