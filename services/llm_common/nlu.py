@@ -27,11 +27,14 @@ _RECHAZA_RE = re.compile(
 
 _UNIDAD_MAP: dict[str, str] = {
     "kg": "Kilogram", "kilo": "Kilogram", "kilos": "Kilogram",
-    "kilogramo": "Kilogram", "kilogramos": "Kilogram",
-    "g": "Kilogram", "gr": "Kilogram", "gramo": "Kilogram", "gramos": "Kilogram",
+    "kilogramo": "Kilogram", "kilogramos": "Kilogram", "kilogram": "Kilogram",
+    #  Sub-unidades se mapean a si mismas: normalize_unidad aplica el
+    #  factor de _CONVERSION (g->Kilogram = 0.001). Mapearlas directo a la
+    #  canonica dejaba la conversion muerta (500 gramos = 500 kg!).
+    "g": "g", "gr": "g", "gramo": "g", "gramos": "g",
     "l": "Liter", "lt": "Liter", "lts": "Liter",
-    "litro": "Liter", "litros": "Liter",
-    "ml": "Liter", "mililitro": "Liter", "mililitros": "Liter",
+    "litro": "Liter", "litros": "Liter", "liter": "Liter",
+    "ml": "ml", "mililitro": "ml", "mililitros": "ml",
     "un": "Unidad", "und": "Unidad", "unds": "Unidad",
     "unidad": "Unidad", "unidades": "Unidad",
     "pza": "Unidad", "pzas": "Unidad", "pieza": "Unidad", "piezas": "Unidad",
@@ -103,6 +106,51 @@ def parse_conteo_rapido(texto: str) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+#  Fast path: escrituras con direccion (agregar vs remover)
+# ---------------------------------------------------------------------------
+
+_VERBOS_AGREGAR = (
+    r"(?:agreg(?:ar?|a|ue)|añad(?:ir?|e)|ingresa[r]?|met(?:er?|a|eme)"
+    r"|pon(?:er?|e|ga?)|carga[r]?|sube[r]?)"
+)
+_VERBOS_REMOVER = (
+    r"(?:sac(?:ar?|a)|remov(?:er?|e)|retira[r]?|quita[r]?|vend(?:er?|e)"
+    r"|descontar|descuenta|resta[r]?|baja[r]?)"
+)
+_NUM = r"(?P<cantidad>\d+(?:[\.,]\d+)?)"
+_UNI = (
+    r"(?:(?P<unidad>kilos?|kilogramos?|kg|gramos?|gr?|litros?|lts?|ml"
+    r"|unidades?|un\.?|unds?|piezas?|pzs?|cajas?|paquetes?|sobres?|frascos?|rollos?)\s+)?"
+)
+_TAIL = _NUM + r"\s*" + _UNI + r"(?:de\s+)?(?P<producto>.+?)\s*[.,;!?]?$"
+
+_ESCRITURA_AGREGAR_RE = re.compile(_VERBOS_AGREGAR + r"\s+" + _TAIL, re.IGNORECASE)
+_ESCRITURA_REMOVER_RE = re.compile(_VERBOS_REMOVER + r"\s+" + _TAIL, re.IGNORECASE)
+
+
+def parse_escritura_rapida(texto: str) -> dict | None:
+    """Fast path determinista para escrituras: <verbo> <num> [unidad] [de] <producto>.
+
+    A diferencia de parse_conteo_rapido, distingue direccion.
+    Retorna {"tool": "agregar_inventario"|"remover_inventario",
+             "cantidad": float, "unidad": str|None, "producto": str}
+    o None si no matchea (a si lo intenta el modelo).
+    """
+    t = texto.strip()
+    for pat, tool in ((_ESCRITURA_AGREGAR_RE, "agregar_inventario"),
+                      (_ESCRITURA_REMOVER_RE, "remover_inventario")):
+        m = pat.search(t)
+        if m:
+            return {
+                "tool": tool,
+                "cantidad": float(m.group("cantidad").replace(",", ".")),
+                "unidad": _normalizar_unidad_raw((m.group("unidad") or "").lower()) or None,
+                "producto": m.group("producto").strip(),
+            }
+    return None
+
+
 def extract_unidad(texto: str) -> str | None:
     """Extrae la primera mencion de unidad en el texto."""
     m = _UNIDAD_REGEX.search(texto)
@@ -166,6 +214,19 @@ def parse_confirmacion(text: str) -> bool | None:
 #  Normalizacion de producto (dinamica, desde catalogo)
 # ---------------------------------------------------------------------------
 
+def _match_producto_en_texto(texto: str, producto_nombres: set[str]) -> str | None:
+    """Primer nombre del catalogo que aparece en el texto, con limites de
+    palabra y plural opcional. Sin \b, "ajo" matcheaba dentro de "trabajo".
+    Se prueba primero el nombre mas largo (gana "aceite de ajonjoli" a
+    "ajonjoli").
+    """
+    t = texto.lower()
+    for nombre in sorted(producto_nombres, key=len, reverse=True):
+        if re.search(r"\b" + re.escape(nombre) + r"s?\b", t):
+            return nombre
+    return None
+
+
 def normalize_producto(val: str, producto_nombres: set[str]) -> str:
     """Busca si `val` contiene algun nombre de producto conocido.
 
@@ -179,20 +240,12 @@ def normalize_producto(val: str, producto_nombres: set[str]) -> str:
     if v in producto_nombres:
         return v
 
-    for nombre in sorted(producto_nombres, key=len, reverse=True):
-        if nombre in v:
-            return nombre
-
-    return ""
+    return _match_producto_en_texto(v, producto_nombres) or ""
 
 
 def extract_producto(query: str, producto_nombres: set[str]) -> str | None:
     """Busca el primer nombre de producto que aparece en el query."""
-    q = query.lower()
-    for nombre in sorted(producto_nombres, key=len, reverse=True):
-        if nombre in q:
-            return nombre
-    return None
+    return _match_producto_en_texto(query.lower(), producto_nombres)
 
 
 # ---------------------------------------------------------------------------

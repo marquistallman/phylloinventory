@@ -75,16 +75,24 @@ async def execute(sql: str, *args: Any) -> str:
 # =====================================================================
 
 async def find_producto(nombre: str, bodega_id: int | None = None) -> dict | None:
-    """Busca producto por nombre (exacto, para compatibilidad)."""
+    """Busca producto por nombre (case-insensitive).
+
+    Sin bodega_id: match global DETERMINISTA — gana la bodega de menor id
+    (bodega_default=1 en el demo), no una fila al azar de las 55 bodegas.
+    """
     if bodega_id is not None:
         return await fetchrow(
             """SELECT id, nombre, unidad, stock_actual, bodega_id
                FROM productos_en_bodega
-               WHERE nombre = $1 AND bodega_id = $2""",
+               WHERE lower(nombre) = lower($1) AND bodega_id = $2""",
             nombre, bodega_id,
         )
     return await fetchrow(
-        "SELECT id, nombre, unidad, stock_actual, bodega_id FROM productos_en_bodega WHERE nombre = $1",
+        """SELECT id, nombre, unidad, stock_actual, bodega_id
+           FROM productos_en_bodega
+           WHERE lower(nombre) = lower($1)
+           ORDER BY bodega_id, id
+           LIMIT 1""",
         nombre,
     )
 
@@ -164,14 +172,25 @@ async def get_catalogo_bodega(
     return result
 
 
-async def get_producto_nombres_bodega(bodega_id: int) -> list[dict]:
-    """Retorna id, nombre, unidad de todos los productos de una bodega."""
+async def get_producto_nombres_bodega(bodega_id: int | None = None) -> list[dict]:
+    """Retorna id, nombre, unidad de los productos de una bodega.
+
+    bodega_id=None -> catalogo GLOBAL: un representante por nombre
+    (gana la bodega de menor id). Es el fallback para que la CLI sin
+    bodega activa pueda resolver productos igualmente.
+    """
+    if bodega_id is not None:
+        return await fetch(
+            """SELECT id, nombre, unidad
+               FROM productos_en_bodega
+               WHERE bodega_id = $1
+               ORDER BY nombre""",
+            bodega_id,
+        )
     return await fetch(
-        """SELECT id, nombre, unidad
+        """SELECT DISTINCT ON (lower(nombre)) id, nombre, unidad
            FROM productos_en_bodega
-           WHERE bodega_id = $1
-           ORDER BY nombre""",
-        bodega_id,
+           ORDER BY lower(nombre), bodega_id, id"""
     )
 
 
