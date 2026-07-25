@@ -12,6 +12,11 @@ from typing import Any
 
 import httpx
 
+#  Carga .env / .env.example para que GATEWAY_URL, VOICE_WS_URL,
+#  CLI_POLL_TIMEOUT, etc. reflejen el .env del usuario si existe.
+from .env_loader import load_env
+load_env()
+
 GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://127.0.0.1:8200")
 # Mantenido por compatibilidad — el gateway hace el routing ahora.
 VOICE_WS_URL = os.getenv("VOICE_WS_URL", "ws://127.0.0.1:8100/ws/transcribe")
@@ -25,7 +30,10 @@ POLL_INTERVAL_S = float(os.getenv("CLI_POLL_INTERVAL", "0.2"))
 # =====================================================================
 
 async def health() -> dict:
-    async with httpx.AsyncClient(timeout=5) as client:
+    #  El /health del gateway hace hasta 5 sub-pings (needle, kokoro, voice,
+    #  elevenlabs, db) cada uno con su propio timeout de 3s. 15s de piso.
+    #  Sumamos margen para el setup de la conexion.
+    async with httpx.AsyncClient(timeout=20) as client:
         r = await client.get(f"{GATEWAY_URL}/health")
         r.raise_for_status()
         return r.json()

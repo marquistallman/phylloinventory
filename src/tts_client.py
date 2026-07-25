@@ -13,6 +13,10 @@ from typing import Optional
 import httpx
 import numpy as np
 
+#  Carga .env / .env.example para KOKORO_URL y DISABLE_TTS.
+from .env_loader import load_env
+load_env()
+
 try:
     import sounddevice as sd  # type: ignore
 except ImportError:

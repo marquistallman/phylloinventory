@@ -32,6 +32,10 @@ import numpy as np
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("kokoro-service")
 

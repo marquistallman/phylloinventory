@@ -3,3 +3,4 @@ uvicorn[standard]>=0.27
 soundfile>=0.12
 numpy
 kokoro>=0.9.4
+python-dotenv>=1.0

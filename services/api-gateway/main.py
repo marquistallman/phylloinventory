@@ -26,6 +26,11 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+#  Prioridad: shell env > .env > .env.example.
+from llm_common.env_loader import load_env
+load_env()
+
 from llm_common.db import (
     fetch,
     fetchrow,
@@ -446,17 +451,19 @@ async def audio_speak(req: SpeakRequest):
         payload = {"text": req.text}
         if req.voice_id:
             payload["voice_id"] = req.voice_id
-        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
-            try:
-                async with client.stream(
-                    "POST", f"{ELEVENLABS_URL}/speak", json=payload,
-                ) as r:
-                    if r.status_code == 200:
-                        return _proxy_tts_stream(r, "elevenlabs", fallback=False)
-                    logger.warning("TTS elevenlabs http %d, falling back to kokoro",
-                                   r.status_code)
-            except (httpx.RequestError, httpx.TimeoutException) as e:
-                logger.warning("TTS elevenlabs transport error: %s, falling back", e)
+        #  Leemos el audio completo en memoria antes de streamearlo al cliente.
+        #  Esto evita el bug donde el `async with client.stream(...)` cierra la
+        #  conexion al backend al salir de la funcion, pero el generator que
+        #  pasamos a StreamingResponse todavia esta leyendo de esa conexion.
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
+                r = await client.post(f"{ELEVENLABS_URL}/speak", json=payload)
+                if r.status_code == 200:
+                    return _build_tts_response(r, "elevenlabs", fallback=False)
+                logger.warning("TTS elevenlabs http %d, falling back to kokoro",
+                               r.status_code)
+        except (httpx.RequestError, httpx.TimeoutException) as e:
+            logger.warning("TTS elevenlabs transport error: %s, falling back", e)
         # Fallback: Kokoro
         return await _kokoro_speak(req.text, req.speed, fallback=True)
     # pick == "kokoro"
@@ -467,35 +474,35 @@ async def _kokoro_speak(text: str, speed: float | None, fallback: bool) -> Strea
     payload: dict[str, Any] = {"text": text}
     if speed is not None:
         payload["speed"] = speed
-    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
-        try:
-            async with client.stream(
-                "POST", f"{KOKORO_URL}/speak", json=payload,
-            ) as r:
-                if r.status_code != 200:
-                    raise HTTPException(r.status_code, f"kokoro error: {r.text[:200]}")
-                return _proxy_tts_stream(r, "kokoro", fallback=fallback)
-        except httpx.RequestError as e:
-            raise HTTPException(503, f"kokoro unreachable: {e}")
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as client:
+            r = await client.post(f"{KOKORO_URL}/speak", json=payload)
+            if r.status_code != 200:
+                raise HTTPException(r.status_code, f"kokoro error: {r.text[:200]}")
+            return _build_tts_response(r, "kokoro", fallback=fallback)
+    except httpx.RequestError as e:
+        raise HTTPException(503, f"kokoro unreachable: {e}")
 
 
-def _proxy_tts_stream(upstream: httpx.Response, backend: str, fallback: bool) -> StreamingResponse:
+def _build_tts_response(upstream: httpx.Response, backend: str, fallback: bool) -> StreamingResponse:
+    """Empaqueta el audio del backend en una StreamingResponse.
+
+    Leemos el body completo en memoria (los TTS producen < 1MB por oracion)
+    para evitar problemas con el ciclo de vida del cliente httpx hacia el
+    backend cuando el cliente HTTP del gateway se desconecta mid-stream.
+    """
+    audio_bytes = upstream.content
     extra = {
         "X-Backend": backend,
         "X-Backend-Requested": "elevenlabs" if _pick_tts() == "elevenlabs" else "kokoro",
         "X-Fallback-Used": "true" if fallback else "false",
+        "Content-Length": str(len(audio_bytes)),
     }
     for h in ("X-Sample-Rate", "X-Channels", "X-Sample-Width", "X-Endian", "X-Voice-Id", "X-Model-Id"):
         if h in upstream.headers:
             extra[h] = upstream.headers[h]
     ctype = upstream.headers.get("content-type", "audio/pcm")
-
-    async def gen():
-        async for chunk in upstream.aiter_bytes(chunk_size=4096):
-            if chunk:
-                yield chunk
-
-    return StreamingResponse(gen(), media_type=ctype, headers=extra)
+    return Response(content=audio_bytes, media_type=ctype, headers=extra)
 
 
 # =====================================================================

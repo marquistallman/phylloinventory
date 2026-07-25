@@ -20,6 +20,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
 from llm_common.db import enqueue_pending, get_pending_status, close_pool, get_producto_nombres_bodega
 from llm_common.nlu import (
     build_alert_context,

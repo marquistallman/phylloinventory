@@ -14,6 +14,10 @@ import sys
 import tempfile
 from typing import Optional
 
+#  Carga .env / .env.example. Es idempotente — no rompe si la CLI ya lo cargo.
+from .env_loader import load_env
+load_env()
+
 try:
     import sounddevice as sd  # type: ignore
 except ImportError:

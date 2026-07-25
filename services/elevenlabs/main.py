@@ -29,6 +29,10 @@ import httpx
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("elevenlabs-service")
 

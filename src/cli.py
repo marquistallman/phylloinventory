@@ -27,6 +27,11 @@ from rich.status import Status
 from rich.table import Table
 from rich.text import Text
 
+#  Carga .env / .env.example ANTES de importar api_client / tts_client,
+#  que leen os.getenv() a nivel de modulo. Prioridad: shell > .env > .env.example.
+from .env_loader import load_env
+load_env()
+
 # Compat: rich>=13 usa `box` (instancia Box), rich>=15 usa Box en `box`
 try:
     box = _box_module.box  # type: ignore[attr-defined]
@@ -544,7 +549,14 @@ async def handle_voice(state: SessionState) -> None:
 # =====================================================================
 
 async def handle_cloud(state: SessionState, args: str) -> None:
-    """`cloud on|off|status` o `cloud stt=elevenlabs tts=elevenlabs` etc."""
+    """`cloud on|off|status` o `cloud stt=elevenlabs tts=elevenlabs` etc.
+
+    Comportamiento:
+      - sin args / "status"      -> muestra config actual
+      - "on" / "off"             -> toggle cloud global
+      - "k=v k=v ..."            -> override por-backend (cualquier combinacion)
+      - cualquier otra cosa      -> muestra config + hint de uso
+    """
     args = args.strip()
     if not args or args == "status":
         try:
@@ -568,8 +580,32 @@ async def handle_cloud(state: SessionState, args: str) -> None:
             console.print("  [dim]Tip: el gateway probara cloud primero; si falla, fallback a local automatico.[/dim]")
         return
     #  Override por-backend: cloud stt=elevenlabs tts=kokoro llm=auto
+    #  Si NINGUN token tiene '=', asumimos que el usuario quiso "status"
+    #  y mostramos la config + hint de uso (mas util que tirar "ignoro").
+    tokens = args.split()
+    has_kv = any("=" in t for t in tokens)
+    if not has_kv:
+        console.print(
+            f"[yellow]Subcomando '{args}' no reconocido. Mostrando estado actual:[/yellow]"
+        )
+        try:
+            cfg = await api_client.get_config()
+        except Exception as e:
+            console.print(f"[red]No se pudo leer config: {e}[/red]")
+            return
+        _print_config(cfg)
+        console.print()
+        console.print(
+            "[dim]uso:[/dim]\n"
+            "  [cyan]cloud on|off[/cyan]              toggle global\n"
+            "  [cyan]cloud status[/cyan]              ver config actual\n"
+            "  [cyan]cloud llm=openrouter[/cyan]      override por-backend (stt, tts, llm)\n"
+            "  [cyan]cloud stt=whisper tts=elevenlabs[/cyan]  (cualquier combinacion)\n"
+            "  [cyan]cloud llm=auto[/cyan]            volver al toggle global para un backend"
+        )
+        return
     overrides: dict = {}
-    for token in args.split():
+    for token in tokens:
         if "=" not in token:
             console.print(f"[yellow]ignoro token '{token}' (esperaba k=v)[/yellow]")
             continue
@@ -581,7 +617,9 @@ async def handle_cloud(state: SessionState, args: str) -> None:
             continue
         overrides[k] = v
     if not overrides:
-        console.print("[yellow]uso: cloud on|off|status | cloud llm=needle stt=whisper tts=kokoro[/yellow]")
+        console.print(
+            "[yellow]uso: cloud on|off|status | cloud llm=needle stt=whisper tts=kokoro[/yellow]"
+        )
         return
     try:
         cfg = await api_client.set_config(**overrides)
@@ -655,8 +693,21 @@ async def main_async(args: argparse.Namespace) -> int:
         backend = h.get("config", {}).get("llm") or h.get("backend", "?")
         config = h.get("config", {})
     except Exception as e:
-        console.print(f"[red]No se pudo conectar al api-gateway: {e}[/red]")
-        console.print("[yellow]Asegurate de que docker compose este arriba.[/yellow]")
+        #  httpx.TimeoutException.__str__() devuelve "" en algunas versiones,
+        #  asi que mostramos el tipo + un mensaje mas util que el string vacio.
+        msg = str(e).strip() or f"{type(e).__name__} (sin detalle)"
+        is_timeout = isinstance(e, httpx.TimeoutException)
+        console.print(f"[red]No se pudo conectar al api-gateway ({api_client.GATEWAY_URL}): {msg}[/red]")
+        if is_timeout:
+            console.print(
+                "  [yellow]El gateway tardo mas de 20s en responder.[/yellow]\n"
+                "  [dim]Causas comunes:[/dim]\n"
+                "  [dim]- el contenedor esta arrancando (espera 30s y reintenta)[/dim]\n"
+                "  [dim]- un servicio dependiente (needle/kokoro/voice) no responde y cuelga el health[/dim]\n"
+                "  [dim]- firewall o el puerto 8200 no esta mapeado al host[/dim]"
+            )
+        else:
+            console.print("[yellow]Asegurate de que docker compose este arriba.[/yellow]")
         return 1
 
     #  Estado del microfono local
@@ -722,8 +773,10 @@ async def main_async(args: argparse.Namespace) -> int:
             await handle_voice(state)
             console.print()
             continue
-        if low.startswith("cloud"):
-            await handle_cloud(state, user_input[4:].strip())
+        #  Match exacto "cloud" o "cloud <subcomando>" — evita falsos positivos
+        #  con strings como "cloudx" o "cloud-something" que pasaban con startswith.
+        if low == "cloud" or low.startswith("cloud "):
+            await handle_cloud(state, user_input[len("cloud "):].strip() if low.startswith("cloud ") else "")
             console.print()
             continue
         if low == "voices":
@@ -738,6 +791,20 @@ async def main_async(args: argparse.Namespace) -> int:
             else:
                 try:
                     res = await api_client.speak_remote(phrase)
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 404:
+                        console.print(
+                            f"[red]El gateway no tiene el endpoint /api/audio/speak (404)[/red]\n"
+                            f"  [yellow]Causa probable: el contenedor del api-gateway esta corriendo una version vieja.[/yellow]\n"
+                            f"  [cyan]Reconstrui el stack:[/cyan]\n"
+                            f"    [cyan]docker compose build api-gateway && docker compose up -d api-gateway[/cyan]\n"
+                            f"  [dim]O si corres el gateway en local: reiniciá el proceso para que tome el main.py nuevo.[/dim]"
+                        )
+                    else:
+                        console.print(f"[red]TTS fallo ({e.response.status_code}): {e}[/red]")
+                        console.print("  [dim]Tip: 'cloud status' para ver que backend esta activo.[/dim]")
+                    console.print()
+                    continue
                 except Exception as e:
                     console.print(f"[red]TTS fallo: {e}[/red]")
                     console.print("  [dim]Tip: 'cloud status' para ver que backend esta activo.[/dim]")

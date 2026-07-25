@@ -15,6 +15,10 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
 from llm_common.db import (
     close_pool,
     enqueue_pending,
