@@ -398,6 +398,50 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="api-gateway", version="3.0.0", lifespan=lifespan)
 
+#  CORS para que el frontend (browser) pueda llamar al gateway.
+#  En dev "*" esta bien; en produccion especificar los origins reales.
+_cors_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_cors_origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=[
+        "X-Backend", "X-Backend-Requested", "X-Fallback-Used",
+        "X-Sample-Rate", "X-Channels", "X-Sample-Width", "X-Endian",
+        "X-Voice-Id", "X-Model-Id", "Content-Length",
+    ],
+)
+
+
+#  Auth: si API_KEY esta seteada, todos los endpoints (salvo /health)
+#  requieren el header X-API-Key. Si esta vacia, no se chequea nada.
+async def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
+    if not API_KEY:
+        return  # auth deshabilitada
+    if x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="API key invalida o ausente")
+
+
+#  Rutas publicas (sin auth): health, docs, openapi, redoc
+#  Todo lo demas requiere API_KEY si esta seteada.
+_PUBLIC_PATHS = {"/health", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+
+
+@app.middleware("http")
+async def auth_middleware(request, call_next):
+    """Chequea API key para todas las rutas salvo las publicas."""
+    if API_KEY and request.url.path not in _PUBLIC_PATHS:
+        x_api_key = request.headers.get("X-API-Key") or request.headers.get("x-api-key")
+        if x_api_key != API_KEY:
+            from fastapi.responses import JSONResponse as _J
+            return _J(
+                status_code=401,
+                content={"detail": "API key invalida o ausente. Header requerido: X-API-Key"},
+            )
+    return await call_next(request)
+
 
 # =====================================================================
 #  Schemas
@@ -492,6 +536,13 @@ async def health():
         "status": "ok",
         "config": _current_config(),
         "services": {},
+        "api": {
+            "version": "3.0.0",
+            "auth_required": bool(API_KEY),
+            "cors_origins": _cors_origins,
+            "docs_url": "/docs",
+            "openapi_url": "/openapi.json",
+        },
     }
     async with httpx.AsyncClient(timeout=3) as client:
         targets = [

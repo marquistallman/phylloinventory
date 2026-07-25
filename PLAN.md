@@ -1,6 +1,6 @@
 # Phylloinventory — Documentacion de Implementacion
 
-## Estado: Fases 1-8 completadas
+## Estado: Fases 1-9 completadas (backend listo para frontend)
 
 ---
 
@@ -771,3 +771,99 @@ fallback a `print` plano.
 | `db/migrations/001_normalize_3fn.sql` | (pre-existente, ahora trackeado por el manager) |
 | `src/manager.py` | nuevo (~430 lineas): CLI admin completo |
 | `PLAN.md` | +secciones 8.1-8.4 |
+
+---
+
+## Fase 9 — Backend listo para frontend web (CORS + Auth + Documentacion)
+
+**Proposito**: el nucleo (gateway + servicios + DB) esta completo. La CLI
+local es solo para dev/test. El frontend web real se conecta via HTTP.
+Esta fase deja al gateway production-ready para esa conexion:
+- CORS configurable (que origins pueden llamar)
+- Auth opcional por API key (header `X-API-Key`)
+- Health endpoint que reporta la config del API
+- Documentacion completa de todos los endpoints con ejemplos
+  `fetch` + `curl` para que el equipo de frontend tenga todo
+  lo que necesita sin leer el codigo
+
+### 9.1 CORS
+
+`ALLOWED_ORIGINS` env (default `*`). Lista separada por comas:
+```bash
+ALLOWED_ORIGINS=https://b-link.tu-dominio.com,https://www.b-link.tu-dominio.com
+```
+
+`CORSMiddleware` de FastAPI; permite credenciales, todos los metodos
+y headers. Expone los headers custom (`X-Backend`, `X-Fallback-Used`,
+`X-Sample-Rate`, `X-Voice-Id`, etc) para que el frontend pueda leerlos.
+
+### 9.2 Auth opcional
+
+`API_KEY` env (default vacia = sin auth). Si esta seteada, todos los
+endpoints (salvo `/health`, `/docs`, `/openapi.json`, `/redoc`) requieren
+el header `X-API-Key: <valor>`. Implementado como middleware global
+HTTP (no como `Depends` por ruta) para no repetir en cada endpoint.
+
+Respuesta cuando falta o es incorrecta: `401` con
+`{"detail": "API key invalida o ausente. Header requerido: X-API-Key"}`.
+
+### 9.3 Health endpoint enriquecido
+
+Ademas de status y config, ahora reporta:
+```json
+{
+  "api": {
+    "version": "3.0.0",
+    "auth_required": true,
+    "cors_origins": ["*"],
+    "docs_url": "/docs",
+    "openapi_url": "/openapi.json"
+  }
+}
+```
+
+El frontend lo usa al arrancar para verificar conectividad, version
+y config de CORS/auth.
+
+### 9.4 FRONTEND.md (~700 lineas)
+
+Documentacion completa para el equipo de frontend. Cubre:
+- Configuracion base (URL, API key, CORS)
+- **21 endpoints** documentados con request/response JSON, ejemplos
+  `fetch` y `curl`, y casos de uso
+- Wiring de UI: que componente/boton llama a que endpoint
+- Flujos end-to-end (modo voz, modo manual, polling de pending, etc)
+- Manejo de errores (401, 502, 500, etc)
+- Como generar cliente tipado desde OpenAPI
+- Checklist pre-merge para el equipo de frontend
+- Diagrama de secuencia end-to-end
+
+Endpoints documentados:
+- `GET /health` (publico)
+- `GET/POST /api/config` (toggle cloud, overrides)
+- `GET /api/models`, `POST /api/models/select`
+- `POST /api/narrate` (B-Link, eventos -> texto)
+- `GET /api/audio/voices`
+- `POST /api/audio/transcribir` (STT)
+- `POST /api/audio/speak` (TTS, devuelve stream audio)
+- `GET /api/bodegas`
+- `GET /api/catalogo/bodega/{id}`
+- `POST /api/sesion/iniciar`, `finalizar`
+- `GET /api/sesion/{id}/estado` (polling cada 2s)
+- `POST /api/sesion/registrar-manual`
+- `POST /api/sesion/registrar-voz` (flujo voz completo)
+- `GET /api/reporte/diferencias/{id}`
+- `GET /api/reporte/sospechosos/{id}`
+- `GET /api/pending/{id}` (polling cada 200ms)
+- `POST /query` (chat libre)
+- `GET /inventory`, `/sospechosos`, `/catalog`, `/status/{id}`
+
+### 9.5 Archivos modificados/creados en Fase 9
+
+| Archivo | Cambio |
+|---|---|
+| `services/api-gateway/main.py` | +`CORSMiddleware` (ALLOWED_ORIGINS), +middleware de auth (API_KEY), +`api` info en /health, +env `ALLOWED_ORIGINS` y `API_KEY` |
+| `docker-compose.yml` | +env `ALLOWED_ORIGINS` y `API_KEY` en api-gateway |
+| `.env.example` | +seccion Frontend (CORS + Auth) |
+| `FRONTEND.md` | nuevo: guia completa para el equipo de frontend |
+| `PLAN.md` | +secciones 9.1-9.5 |

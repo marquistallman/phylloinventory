@@ -141,6 +141,9 @@ services:
       VOICE_URL: http://voice-service:8100
       KOKORO_URL: http://kokoro-service:8205
       ELEVENLABS_URL: http://elevenlabs-service:8206
+      #  Frontend: CORS y auth (dejar vacio en dev)
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-*}
+      API_KEY: ${API_KEY:-}
     depends_on:
       postgres:
         condition: service_healthy
