@@ -34,6 +34,7 @@ except AttributeError:
     box = _box_module  # type: ignore[assignment]
 
 from . import api_client
+from . import tts_client
 from .voice_client import record_and_transcribe, available as voice_available
 
 console = Console()
@@ -70,6 +71,7 @@ def show_banner(backend: str, voice_ok: bool = False) -> None:
             "[yellow]Comandos:[/yellow]\n"
             "  texto libre             -> enviar al LLM\n"
             "  voz                     -> dictar por microfono (WS)\n"
+            "  tts <texto>             -> probar TTS (kokoro-service)\n"
             "  inventario              -> ver catalogo (1 fila x producto)\n"
             "  inventario <bodega>     -> stock por bodega\n"
             "  sospechosos [producto]  -> auditoria Kalman\n"
@@ -130,6 +132,114 @@ def risk_label(sigma: float) -> str:
 RISK_COLORS = {"CRITICO": "red", "ALTO": "yellow", "MEDIO": "dim cyan", "BAJO": "green"}
 
 
+# =====================================================================
+#  Narracion TTS (kokoro-service). Fire-and-forget: nunca bloquea el loop.
+# =====================================================================
+
+def _narrate(phrase: str) -> None:
+    """Lanza la reproduccion de TTS en background. Si el servicio no esta
+    disponible o sounddevice falla, simplemente no suena — el flujo sigue."""
+    if not phrase:
+        return
+    #  create_task sin await: el TTS se reproduce en su thread.
+    asyncio.create_task(tts_client.speak(phrase))
+
+
+def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> None:
+    producto = args.get("producto") or "el producto"
+    cantidad = args.get("cantidad")
+    unidad = args.get("unidad") or ""
+
+    if isinstance(inv, dict) and "stock_actual" in inv:
+        stock = inv["stock_actual"]
+        bodega = inv.get("bodega") or "la bodega"
+    elif isinstance(inv, list) and inv:
+        stock = inv[0].get("stock_actual", "?")
+        bodega = inv[0].get("bodega", "la bodega")
+    else:
+        stock = "?"
+        bodega = "la bodega"
+
+    if tool_name == "agregar_inventario":
+        _narrate(f"Se agregaron {cantidad} {unidad} de {producto}. Stock actual: {stock} {unidad}, en {bodega}.")
+    elif tool_name == "remover_inventario":
+        _narrate(f"Se removieron {cantidad} {unidad} de {producto}. Stock actual: {stock} {unidad}, en {bodega}.")
+
+
+def _narrate_sospechosa(args: dict, puntaje: float, residual: float) -> None:
+    producto = args.get("producto") or "el producto"
+    cantidad = args.get("cantidad")
+    unidad = args.get("unidad") or ""
+    tipo = "ingreso" if args.get("tool_name") == "agregar_inventario" else "salida"
+    _narrate(
+        f"Atención. Se detectó un movimiento sospechoso: {tipo} de {cantidad} {unidad} de {producto}. "
+        f"Riesgo de {puntaje:.1f} sigmas. Por favor confirma con sí o no."
+    )
+
+
+def _narrate_confirmada() -> None:
+    _narrate("Movimiento confirmado. El stock fue actualizado.")
+
+
+def _narrate_rechazada() -> None:
+    _narrate("Movimiento rechazado. El stock no fue modificado.")
+
+
+def _narrate_consulta(inv) -> None:
+    if isinstance(inv, dict) and "stock_actual" in inv:
+        _narrate(
+            f"Hay {inv['stock_actual']} {inv.get('unidad', '')} de {inv.get('nombre', 'ese producto')} "
+            f"en {inv.get('bodega', 'la bodega')}."
+        )
+    elif isinstance(inv, list) and inv:
+        if len(inv) == 1:
+            r = inv[0]
+            _narrate(f"Hay {r['stock_actual']} {r.get('unidad', '')} de {r['nombre']} en {r.get('bodega', 'la bodega')}.")
+        else:
+            total = sum(float(r.get("stock_actual") or 0) for r in inv)
+            partes = ", ".join(f"{r.get('stock_actual')} en {r.get('bodega')}" for r in inv[:3])
+            _narrate(f"Hay un total de {total} unidades. Encontre stock en: {partes}.")
+
+
+def _narrate_sospechosos(rows: list[dict]) -> None:
+    if not rows:
+        _narrate("No hay movimientos sospechosos en la auditoria.")
+        return
+    top = max(rows, key=lambda r: r["puntaje_riesgo"])
+    _narrate(
+        f"Encontre {len(rows)} movimientos sospechosos. "
+        f"El mas grave: {top['producto_nombre']}, {top['tipo']} de {top['cantidad_reportada']}, "
+        f"con un riesgo de {top['puntaje_riesgo']:.1f} sigmas."
+    )
+
+
+def _narrate_invalid(tool_name: str, args: dict) -> None:
+    """Caso 'no se encolo' — el LLM devolvio la tool pero el producto/cantidad
+    no son validos, asi que la CLI la descarto y debe avisar al usuario."""
+    prod = args.get("producto") or ""
+    cant = args.get("cantidad")
+    if tool_name == "confirmar_movimiento":
+        _narrate("No entendi la confirmacion. Responde si o no.")
+    elif not prod:
+        accion = "agregar" if tool_name == "agregar_inventario" else "remover"
+        _narrate(
+            f"No se que producto quieres {accion}. "
+            f"Dime algo como: {accion} cinco kilos de papa, o cuanto hay de tomate."
+        )
+    elif cant is None or float(cant) <= 0:
+        _narrate(f"La cantidad no es valida. Cuanto quieres {tool_name.replace('_', ' ')} de {prod}?")
+    else:
+        _narrate(f"No se pudo procesar la operacion sobre {prod}.")
+
+
+def _narrate_no_action() -> None:
+    """Caso 'tool_calls vacio' — el LLM no decidio nada util."""
+    _narrate(
+        "No entendi la instruccion. Prueba con agregar cinco kilos de papa, "
+        "cuanto hay de tomate, o hay algo sospechoso."
+    )
+
+
 def show_sospechosos(rows: list[dict]) -> None:
     if not rows:
         console.print("  [green]No hay movimientos sospechosos.[/green]")
@@ -184,11 +294,13 @@ async def handle_query(state: SessionState, text: str) -> None:
     if not tool_calls:
         if state.last_sospechoso:
             console.print("[yellow]Tienes una alerta pendiente. Responde 'si' o 'no'.[/yellow]")
+            _narrate("Tienes una alerta pendiente. Responde si o no.")
         else:
             console.print(
                 "[yellow]No detecte ninguna accion. Prueba:[/yellow] "
                 "'agrega 4 papas' / 'cuanto hay de tomate' / 'hay algo raro'"
             )
+            _narrate_no_action()
         return
 
     for call in tool_calls:
@@ -209,6 +321,7 @@ async def handle_query(state: SessionState, text: str) -> None:
                 f"  [yellow]i '{n}' no se encolo — revisa producto/cantidad "
                 f"(validos: papa, cebolla, tomate, zanahoria, ajo)[/yellow]"
             )
+            _narrate_invalid(n, call.get("arguments") or {})
     write_actions = [p for p in pending if p["tool_name"] in ("agregar_inventario", "remover_inventario")]
     confirm_actions = [p for p in pending if p["tool_name"] == "confirmar_movimiento"]
     read_actions = [p for p in pending if p["tool_name"] in ("consultar_inventario", "investigar_sospechosos")]
@@ -223,12 +336,14 @@ async def handle_query(state: SessionState, text: str) -> None:
                     show_inventory(inv)
                 else:
                     console.print(f"  [green]{inv['nombre']}: {inv['stock_actual']} unidades[/green]")
+                _narrate_consulta(inv)
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")
         elif ra["tool_name"] == "investigar_sospechosos":
             try:
                 rows = await api_client.get_sospechosos(ra["arguments"].get("producto"))
                 show_sospechosos(rows)
+                _narrate_sospechosos(rows)
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")
 
@@ -263,11 +378,13 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
                     f"{inv['nombre']} stock={inv['stock_actual']} · residual={residual:.1f}s"
                 )
                 state.last_sospechoso = None
+                _narrate_aceptada(name, args, inv)
                 return
         except Exception:
             pass
         console.print(f"  [bold green]V {name} ACEPTADO[/bold green] (pending #{pid})")
         state.last_sospechoso = None
+        _narrate_aceptada(name, args, None)
         return
 
     if status == "CONFIRMADA_MANUAL":
@@ -281,6 +398,7 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
         result = payload.get("result", "Movimiento confirmado")
         console.print(f"  [bold green]V {result}[/bold green]")
         state.last_sospechoso = None
+        _narrate_confirmada()
         return
 
     if status == "RECHAZADA":
@@ -294,6 +412,7 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
         result = payload.get("result", "Movimiento rechazado")
         console.print(f"  [bold red]X {result}[/bold red]")
         state.last_sospechoso = None
+        _narrate_rechazada()
         return
 
     if status == "SOSPECHOSA":
@@ -305,6 +424,7 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
             "residual": residual,
             "puntaje_riesgo": puntaje,
         }
+        _narrate_sospechosa({**args, "tool_name": name}, puntaje, residual)
         nivel = risk_label(puntaje)
         color = RISK_COLORS.get(nivel, "white")
         panel = Panel(
@@ -433,6 +553,20 @@ async def main_async(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
+    #  Estado del kokoro-service (TTS)
+    if os.getenv("DISABLE_TTS", "").lower() not in ("1", "true", "yes"):
+        tts_ok = await tts_client.is_available()
+        if tts_ok:
+            console.print("[green]TTS: kokoro-service listo (las respuestas sonaran)[/green]")
+        else:
+            console.print(
+                "[yellow]TTS: kokoro-service no responde en "
+                f"{os.getenv('KOKORO_URL', 'http://127.0.0.1:8205')}[/yellow]\n"
+                "  [dim]Tip: arranca con: docker compose up -d kokoro-service[/dim]"
+            )
+    else:
+        console.print("[dim]TTS: desactivado por env (DISABLE_TTS=1)[/dim]")
+
     state = SessionState()
     while True:
         prompt = (
@@ -462,6 +596,24 @@ async def main_async(args: argparse.Namespace) -> int:
             continue
         if low == "voz":
             await handle_voice(state)
+            console.print()
+            continue
+        if low.startswith("tts "):
+            #  tts <texto> — manda al kokoro-service para probar TTS
+            phrase = user_input[4:].strip()
+            if not phrase:
+                console.print("[yellow]uso: tts <texto a pronunciar>[/yellow]")
+            else:
+                ok = await tts_client.speak(phrase)
+                if not ok:
+                    console.print(
+                        f"[red]No se pudo reproducir (TTS caido o sin audio). "
+                        f"URL: {os.getenv('KOKORO_URL', 'http://127.0.0.1:8205')}[/red]"
+                    )
+            console.print()
+            continue
+        if low == "tts":
+            console.print("[yellow]uso: tts <texto a pronunciar>[/yellow]")
             console.print()
             continue
         if low == "inventario":

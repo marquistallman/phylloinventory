@@ -127,6 +127,7 @@ services:
       LLM_BACKEND: ${LLM_BACKEND:-needle}
       NEEDLE_URL: http://needle-service:8081
       OPENROUTER_URL: http://openrouter-service:8082
+      KOKORO_URL: http://kokoro-service:8205
     depends_on:
       postgres:
         condition: service_healthy
@@ -136,6 +137,25 @@ services:
         condition: service_started
     ports:
       - "8200:8200"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  kokoro-service — TTS (Kokoro 82M/84M, streaming por oracion)
+  # -------------------------------------------------------------------
+  kokoro-service:
+    build:
+      context: .
+      dockerfile: services/kokoro_svc/Dockerfile
+    container_name: cactus_kokoro
+    environment:
+      LANG_CODE: ${KOKORO_LANG:-e}      # 'e' = espanol
+      VOICE:     ${KOKORO_VOICE:-ef_dora}
+      SPEED:     ${KOKORO_SPEED:-1.0}
+      PORT:      "8205"
+    ports:
+      - "8205:8205"
     networks:
       - cactus_net
     logging: *default-logging
