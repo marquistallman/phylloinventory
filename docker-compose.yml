@@ -2,16 +2,19 @@
 #  Cactus Inventory — Microservicios
 #
 #  Perfiles:
-#    default (sin profile) -> postgres, kalman-worker, needle-service, api-gateway
-#    --profile with-voice      -> agrega voice-service
-#    --profile with-openrouter -> agrega openrouter-service y lo selecciona como backend
+#    default (sin profile) -> postgres, kalman-worker, needle-service, api-gateway, kokoro-service
+#    --profile with-voice      -> agrega voice-service (Whisper local para STT)
+#    --profile with-openrouter -> agrega openrouter-service y lo selecciona como backend LLM
+#    --profile with-elevenlabs -> agrega elevenlabs-service (STT + TTS cloud)
 #
 #  Uso:
-#    docker compose up -d                              # minimo (needle)
-#    docker compose --profile with-voice up -d         # + voz
-#    docker compose --profile with-openrouter --profile with-voice up -d  # todo
+#    docker compose up -d                                            # minimo (needle + kokoro)
+#    docker compose --profile with-voice up -d                       # + voz local
+#    docker compose --profile with-elevenlabs up -d                  # + STT/TTS cloud
+#    docker compose --profile with-openrouter --profile with-elevenlabs up -d  # todo cloud
 #
 #  LLM_BACKEND=needle|openrouter cambia el backend por env (default needle)
+#  CLOUD_ENABLED=true|false        activa el toggle runtime por env (tambien via POST /api/config)
 # =====================================================================
 
 x-logging: &default-logging
@@ -104,7 +107,7 @@ services:
       DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
       OPENROUTER_BASE: ${OPENROUTER_BASE:-https://openrouter.ai/api/v1}
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-3.5-haiku}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-deepseek/deepseek-v4-flash}
     depends_on:
       postgres:
         condition: service_healthy
@@ -125,9 +128,14 @@ services:
     environment:
       DATABASE_URL: postgres://cactus:cactus@postgres:5432/inventario?sslmode=disable
       LLM_BACKEND: ${LLM_BACKEND:-needle}
+      STT_BACKEND: ${STT_BACKEND:-whisper}
+      TTS_BACKEND: ${TTS_BACKEND:-kokoro}
+      CLOUD_ENABLED: ${CLOUD_ENABLED:-false}
       NEEDLE_URL: http://needle-service:8081
       OPENROUTER_URL: http://openrouter-service:8082
+      VOICE_URL: http://voice-service:8100
       KOKORO_URL: http://kokoro-service:8205
+      ELEVENLABS_URL: http://elevenlabs-service:8206
     depends_on:
       postgres:
         condition: service_healthy
@@ -176,6 +184,29 @@ services:
       VOICE_SILENCE_SECS: "0.8"
     ports:
       - "8100:8100"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  elevenlabs-service — STT + TTS cloud (perfil with-elevenlabs)
+  # -------------------------------------------------------------------
+  elevenlabs-service:
+    profiles: ["with-elevenlabs"]
+    build:
+      context: .
+      dockerfile: services/elevenlabs/Dockerfile
+    container_name: cactus_elevenlabs
+    environment:
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_BASE: ${ELEVENLABS_BASE:-https://api.elevenlabs.io}
+      ELEVENLABS_VOICE_ID: ${ELEVENLABS_VOICE_ID:-21m00Tcm4TlvDq8ikWAM}
+      ELEVENLABS_STT_MODEL: ${ELEVENLABS_STT_MODEL:-scribe_v1}
+      ELEVENLABS_TTS_MODEL: ${ELEVENLABS_TTS_MODEL:-eleven_multilingual_v2}
+      ELEVENLABS_TTS_OUTPUT: ${ELEVENLABS_TTS_OUTPUT:-pcm_24000}
+      PORT: "8206"
+    ports:
+      - "8206:8206"
     networks:
       - cactus_net
     logging: *default-logging

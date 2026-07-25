@@ -143,3 +143,62 @@ async def is_available(timeout_s: float = 2.0) -> bool:
             return r.status_code == 200
     except Exception:
         return False
+
+
+async def play_pcm(pcm_bytes: bytes, sample_rate: int = 24000) -> bool:
+    """Reproduce un buffer PCM int16 LE ya recibido (sin pasar por HTTP).
+
+    Usado por el comando `tts` de la CLI cuando el gateway devuelve el
+    audio (puede venir de kokoro o elevenlabs, indistinguible: ambos
+    devuelven PCM int16 LE mono al sample rate que indiquen los headers).
+    """
+    if not _audio_available() or not pcm_bytes:
+        return False
+    return await asyncio.get_event_loop().run_in_executor(
+        None, _play_pcm_blocking, pcm_bytes, sample_rate,
+    )
+
+
+def _play_pcm_blocking(pcm_bytes: bytes, sample_rate: int) -> bool:
+    global _cancel_event
+    with _play_lock:
+        _cancel_event.set()
+        _cancel_event = threading.Event()
+        my_cancel = _cancel_event
+    return _speak_with_cancel_bytes(pcm_bytes, sample_rate, my_cancel)
+
+
+def _speak_with_cancel_bytes(pcm_bytes: bytes, sample_rate: int, cancel: threading.Event) -> bool:
+    blocksize = sample_rate * BLOCK_MS // 1000
+    stream = None
+    try:
+        try:
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=CHANNELS,
+                dtype=DTYPE,
+                blocksize=blocksize,
+            )
+            stream.start()
+        except Exception as e:
+            logger.warning("No se pudo abrir audio output: %s", e)
+            return False
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        if samples.size:
+            #  Cortar en bloques de blocksize para poder chequear cancel
+            for i in range(0, samples.size, blocksize):
+                if cancel.is_set():
+                    return False
+                stream.write(samples[i:i + blocksize])
+        logger.info("TTS reprodujo %d muestras a %dHz", samples.size, sample_rate)
+        return True
+    except Exception as e:
+        logger.warning("TTS playback error: %s", e)
+        return False
+    finally:
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass

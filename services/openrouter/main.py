@@ -36,7 +36,9 @@ logger = logging.getLogger("openrouter-service")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku")
+# Default: DeepSeek V4 Flash — smart, tool calling solido, ~$0.09/M in.
+# Alternativa gratis: google/gemma-4-31b-it:free
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
 SYSTEM_PROMPT = os.getenv(
     "OPENROUTER_SYSTEM_PROMPT",
     "Eres un asistente de inventario en español. Hablas de forma natural y breve.",

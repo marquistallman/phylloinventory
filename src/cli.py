@@ -54,30 +54,46 @@ class SessionState:
 #  Banner / render
 # =====================================================================
 
-def show_banner(backend: str, voice_ok: bool = False) -> None:
+def show_banner(backend: str, voice_ok: bool = False, config: dict | None = None) -> None:
+    if config is None:
+        config = {}
+    cfg = config.get("config", config) if isinstance(config.get("config"), dict) else config
+    llm = cfg.get("llm", backend)
+    stt = cfg.get("stt", "?")
+    tts = cfg.get("tts", "?")
+    cloud = cfg.get("cloud_enabled", False)
+    cloud_tag = " [bold magenta]CLOUD[/bold magenta]" if cloud else ""
+
     voice_line = (
-        "[green]Voz: disponible (Whisper listo)[/green]"
+        "[green]Voz: OK (microfono disponible)[/green]"
         if voice_ok
-        else "[yellow]Voz: no disponible (activa con: docker compose --profile with-voice up -d)[/yellow]"
+        else "[yellow]Voz: sounddevice no instalado (pip install sounddevice)[/yellow]"
+    )
+    backends_line = (
+        f"[dim]LLM: [bold cyan]{llm}[/bold cyan]  "
+        f"STT: [bold cyan]{stt}[/bold cyan]  "
+        f"TTS: [bold cyan]{tts}[/bold cyan][/dim]{cloud_tag}"
     )
     panel = Panel(
         Align.center(
             Text.from_markup(
                 "[bold green]Cactus Inventory - Microservicios[/bold green]\n"
-                f"[dim]Backend LLM: [bold cyan]{backend}[/bold cyan]   "
-                f"Session: [dim]{SESSION_ID}[/dim][/dim]\n"
+                f"Session: [dim]{SESSION_ID}[/dim]\n"
+                f"{backends_line}\n"
                 f"[dim]{voice_line}[/dim]\n"
                 "[dim]Kalman evaluado por worker Go - Cola en PostgreSQL[/dim]\n\n"
-            "[yellow]Comandos:[/yellow]\n"
-            "  texto libre             -> enviar al LLM\n"
-            "  voz                     -> dictar por microfono (WS)\n"
-            "  tts <texto>             -> probar TTS (kokoro-service)\n"
-            "  inventario              -> ver catalogo (1 fila x producto)\n"
-            "  inventario <bodega>     -> stock por bodega\n"
-            "  sospechosos [producto]  -> auditoria Kalman\n"
-            "  salir / exit / q        -> cerrar\n"
-            "  ayuda / help            -> mostrar este banner\n"
-            "  limpiar / clear         -> limpiar pantalla"
+                "[yellow]Comandos:[/yellow]\n"
+                "  texto libre             -> enviar al LLM\n"
+                "  voz                     -> dictar por microfono\n"
+                "  tts <texto>             -> probar TTS (sintetiza y reproduce)\n"
+                "  cloud on|off|status     -> toggle cloud (Eleven Labs + OpenRouter)\n"
+                "  voices                  -> listar voces Eleven Labs disponibles\n"
+                "  inventario              -> ver catalogo (1 fila x producto)\n"
+                "  inventario <bodega>     -> stock por bodega\n"
+                "  sospechosos [producto]  -> auditoria Kalman\n"
+                "  salir / exit / q        -> cerrar\n"
+                "  ayuda / help            -> mostrar este banner\n"
+                "  limpiar / clear         -> limpiar pantalla"
             ),
             vertical="middle",
         ),
@@ -290,6 +306,15 @@ async def handle_query(state: SessionState, text: str) -> None:
     if resp.get("raw_output"):
         console.print(f"  [dim]LLM: {resp['raw_output'][:120]}[/dim]")
 
+    #  Indicador de backend y fallback
+    backend = resp.get("backend")
+    requested = resp.get("backend_requested")
+    if backend and requested:
+        if resp.get("fallback_used"):
+            console.print(f"  [yellow]i backend=[/yellow][cyan]{backend}[/cyan][yellow] (solicitado {requested}, fallback por error)[/yellow]")
+        elif backend != requested:
+            console.print(f"  [dim]backend=[/dim][cyan]{backend}[/cyan][dim] (override activo)[/dim]")
+
     tool_calls = resp.get("tool_calls", [])
     if not tool_calls:
         if state.last_sospechoso:
@@ -461,20 +486,21 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
 
 async def handle_voice(state: SessionState) -> None:
     if not voice_available():
-        console.print("[red]Faltan sounddevice y/o websockets.[/red]\n  pip install sounddevice websockets")
+        console.print("[red]Falta sounddevice para capturar audio.[/red]\n  pip install sounddevice")
         return
 
-    #  Pre-check HTTP para dar un mensaje claro si voice-service no esta
-    from .voice_client import check_voice_service, _http_base_from_ws
-    base = _http_base_from_ws(api_client.VOICE_WS_URL)
-    if not check_voice_service(f"{base}/health"):
-        console.print(
-            f"[red]voice-service no responde en {base}/health[/red]\n"
-            f"  [yellow]Levanta el servicio con:[/yellow]\n"
-            f"  [cyan]docker compose --profile with-voice up -d voice-service[/cyan]\n"
-            f"  [dim]Tip: la primera vez tarda ~30s mientras Whisper descarga el modelo.[/dim]"
-        )
+    #  Pre-check: que el gateway este vivo (el gateway ya hace el routing al backend activo)
+    try:
+        h = await api_client.health()
+    except Exception as e:
+        console.print(f"[red]api-gateway no responde: {e}[/red]")
         return
+    cfg = h.get("config", {})
+    stt = cfg.get("stt", "?")
+    console.print(
+        f"[dim]STT activo: [cyan]{stt}[/cyan]  "
+        f"({'cloud' if cfg.get('cloud_enabled') else 'local'})[/dim]"
+    )
 
     console.print("[bold magenta]Grabando... presiona Enter para detener[/bold magenta]")
     stop = asyncio.Event()
@@ -486,35 +512,131 @@ async def handle_voice(state: SessionState) -> None:
             pass
         stop.set()
 
-    #  Thread daemon (no executor): si muere el proceso, no bloquea la salida
     import threading
     enter_thread = threading.Thread(target=_wait_enter, daemon=True)
     enter_thread.start()
 
     try:
-        text: str | None = await record_and_transcribe(api_client.VOICE_WS_URL, stop)
+        text: str | None = await record_and_transcribe(stop)
     except Exception as e:
         console.print(f"[red]Error de voz: {e}[/red]")
         console.print("  [dim]Tip: puedes seguir escribiendo texto normalmente.[/dim]")
         text = None
     finally:
         stop.set()
-        #  Si el usuario nunca presiono Enter (path de error), el thread sigue
-        #  bloqueado en input(). Esperarlo aqui evita que dos lectores peleen
-        #  por stdin en el proximo prompt.
         if enter_thread.is_alive():
             console.print("[dim](presiona Enter para continuar)[/dim]")
             await asyncio.get_event_loop().run_in_executor(None, enter_thread.join)
         print()  # limpia el [voz parcial]
 
     if text is None:
-        return  # el error ya se imprimio arriba
+        return
     if not text:
         console.print("[yellow]No se escucho nada util.[/yellow]")
         return
 
     console.print(f"  [dim]Escuchado:[/dim] [bold magenta]{text}[/bold magenta]")
     await handle_query(state, text)
+
+
+# =====================================================================
+#  Cloud toggle / voices
+# =====================================================================
+
+async def handle_cloud(state: SessionState, args: str) -> None:
+    """`cloud on|off|status` o `cloud stt=elevenlabs tts=elevenlabs` etc."""
+    args = args.strip()
+    if not args or args == "status":
+        try:
+            cfg = await api_client.get_config()
+        except Exception as e:
+            console.print(f"[red]No se pudo leer config: {e}[/red]")
+            return
+        _print_config(cfg)
+        return
+    if args in ("on", "off"):
+        try:
+            cfg = await api_client.set_config(cloud_enabled=(args == "on"))
+        except Exception as e:
+            console.print(f"[red]Toggle fallo: {e}[/red]")
+            return
+        console.print(
+            f"[bold green]cloud {'ON' if cfg.get('cloud_enabled') else 'OFF'}[/bold green]  "
+            f"LLM=[cyan]{cfg.get('llm')}[/cyan]  STT=[cyan]{cfg.get('stt')}[/cyan]  TTS=[cyan]{cfg.get('tts')}[/cyan]"
+        )
+        if cfg.get("fallback_used") is False and cfg.get("cloud_enabled"):
+            console.print("  [dim]Tip: el gateway probara cloud primero; si falla, fallback a local automatico.[/dim]")
+        return
+    #  Override por-backend: cloud stt=elevenlabs tts=kokoro llm=auto
+    overrides: dict = {}
+    for token in args.split():
+        if "=" not in token:
+            console.print(f"[yellow]ignoro token '{token}' (esperaba k=v)[/yellow]")
+            continue
+        k, v = token.split("=", 1)
+        k = k.strip().lower()
+        v = v.strip().lower()
+        if k not in ("llm", "stt", "tts"):
+            console.print(f"[yellow]backend '{k}' no soportado (usa llm/stt/tts)[/yellow]")
+            continue
+        overrides[k] = v
+    if not overrides:
+        console.print("[yellow]uso: cloud on|off|status | cloud llm=needle stt=whisper tts=kokoro[/yellow]")
+        return
+    try:
+        cfg = await api_client.set_config(**overrides)
+    except Exception as e:
+        console.print(f"[red]set_config fallo: {e}[/red]")
+        return
+    _print_config(cfg)
+
+
+def _print_config(cfg: dict) -> None:
+    cloud = cfg.get("cloud_enabled", False)
+    color = "magenta" if cloud else "green"
+    console.print(
+        f"[{color}]cloud_enabled = {cloud}[/{color}]\n"
+        f"  LLM = [cyan]{cfg.get('llm')}[/cyan]  (override: {cfg.get('llm_override') or 'auto'})\n"
+        f"  STT = [cyan]{cfg.get('stt')}[/cyan]  (override: {cfg.get('stt_override') or 'auto'})\n"
+        f"  TTS = [cyan]{cfg.get('tts')}[/cyan]  (override: {cfg.get('tts_override') or 'auto'})\n"
+        f"  [dim]defaults (env): llm={cfg.get('defaults', {}).get('llm')}, "
+        f"stt={cfg.get('defaults', {}).get('stt')}, tts={cfg.get('defaults', {}).get('tts')}[/dim]"
+    )
+
+
+async def handle_voices(state: SessionState, args: str) -> None:
+    """`voices` -> lista las voces disponibles del backend TTS activo."""
+    try:
+        data = await api_client.list_voices()
+    except Exception as e:
+        console.print(f"[red]No se pudo listar voces: {e}[/red]")
+        return
+    backend = data.get("backend", "?")
+    default_vid = data.get("default_voice_id", "?")
+    voices = data.get("voices", [])
+    if not voices:
+        console.print("[yellow]No hay voces disponibles.[/yellow]")
+        return
+    table = Table(title=f"Voces disponibles ({backend})", box=box.SIMPLE_HEAVY, border_style="cyan")
+    table.add_column("Voice ID", style="bold", no_wrap=True)
+    table.add_column("Nombre")
+    table.add_column("Categoria")
+    table.add_column("Labels")
+    for v in voices:
+        is_default = v.get("voice_id") == default_vid
+        name = v.get("name", "?")
+        if is_default:
+            name = f"{name}  [green](default)[/green]"
+        labels = v.get("labels") or {}
+        labels_str = ", ".join(f"{k}={val}" for k, val in list(labels.items())[:4])
+        table.add_row(
+            v.get("voice_id", "?"),
+            name,
+            v.get("category", "-") or "-",
+            labels_str or "-",
+        )
+    console.print(table)
+    console.print(f"  [dim]Para usar otra voz en TTS: tts <texto>  (por ahora se usa la default; selector en PWA)[/dim]")
 
 
 # =====================================================================
@@ -530,20 +652,18 @@ async def main_async(args: argparse.Namespace) -> int:
     #  Health check inicial
     try:
         h = await api_client.health()
-        backend = h.get("backend", "?")
+        backend = h.get("config", {}).get("llm") or h.get("backend", "?")
+        config = h.get("config", {})
     except Exception as e:
         console.print(f"[red]No se pudo conectar al api-gateway: {e}[/red]")
         console.print("[yellow]Asegurate de que docker compose este arriba.[/yellow]")
         return 1
 
-    #  Estado del voice-service
-    from .voice_client import check_voice_service, _http_base_from_ws, available as voice_available_lib
-    voice_ok = False
-    if voice_available_lib():
-        base = _http_base_from_ws(api_client.VOICE_WS_URL)
-        voice_ok = check_voice_service(f"{base}/health")
+    #  Estado del microfono local
+    from .voice_client import available as voice_available_lib
+    voice_ok = voice_available_lib()
 
-    show_banner(backend, voice_ok=voice_ok)
+    show_banner(backend, voice_ok=voice_ok, config=config)
     try:
         cat = await api_client.get_catalog()
         if cat:
@@ -553,17 +673,21 @@ async def main_async(args: argparse.Namespace) -> int:
     except Exception:
         pass
 
-    #  Estado del kokoro-service (TTS)
+    #  Estado del TTS (checkeamos kokoro directo solo si esta activo; si no,
+    #  el banner ya muestra TTS=elevenlabs).
     if os.getenv("DISABLE_TTS", "").lower() not in ("1", "true", "yes"):
-        tts_ok = await tts_client.is_available()
-        if tts_ok:
-            console.print("[green]TTS: kokoro-service listo (las respuestas sonaran)[/green]")
+        if config.get("tts") == "kokoro":
+            tts_ok = await tts_client.is_available()
+            if tts_ok:
+                console.print("[green]TTS: kokoro-service listo (las respuestas sonaran)[/green]")
+            else:
+                console.print(
+                    "[yellow]TTS: kokoro-service no responde en "
+                    f"{os.getenv('KOKORO_URL', 'http://127.0.0.1:8205')}[/yellow]\n"
+                    "  [dim]Tip: arranca con: docker compose up -d kokoro-service[/dim]"
+                )
         else:
-            console.print(
-                "[yellow]TTS: kokoro-service no responde en "
-                f"{os.getenv('KOKORO_URL', 'http://127.0.0.1:8205')}[/yellow]\n"
-                "  [dim]Tip: arranca con: docker compose up -d kokoro-service[/dim]"
-            )
+            console.print("[green]TTS: elevenlabs activo (cloud)[/green]")
     else:
         console.print("[dim]TTS: desactivado por env (DISABLE_TTS=1)[/dim]")
 
@@ -588,28 +712,48 @@ async def main_async(args: argparse.Namespace) -> int:
             console.print("[dim]Adios.[/dim]")
             break
         if low in HELP:
-            show_banner(backend)
+            show_banner(backend, voice_ok=voice_ok, config=config)
             continue
         if low in CLEAR:
             console.clear()
-            show_banner(backend)
+            show_banner(backend, voice_ok=voice_ok, config=config)
             continue
         if low == "voz":
             await handle_voice(state)
             console.print()
             continue
+        if low.startswith("cloud"):
+            await handle_cloud(state, user_input[4:].strip())
+            console.print()
+            continue
+        if low == "voices":
+            await handle_voices(state, "")
+            console.print()
+            continue
         if low.startswith("tts "):
-            #  tts <texto> — manda al kokoro-service para probar TTS
+            #  tts <texto> — el gateway elige el backend (kokoro o elevenlabs)
             phrase = user_input[4:].strip()
             if not phrase:
                 console.print("[yellow]uso: tts <texto a pronunciar>[/yellow]")
             else:
-                ok = await tts_client.speak(phrase)
-                if not ok:
-                    console.print(
-                        f"[red]No se pudo reproducir (TTS caido o sin audio). "
-                        f"URL: {os.getenv('KOKORO_URL', 'http://127.0.0.1:8205')}[/red]"
-                    )
+                try:
+                    res = await api_client.speak_remote(phrase)
+                except Exception as e:
+                    console.print(f"[red]TTS fallo: {e}[/red]")
+                    console.print("  [dim]Tip: 'cloud status' para ver que backend esta activo.[/dim]")
+                    console.print()
+                    continue
+                #  Reproducir el audio recibido (PCM int16)
+                backend = res.get("backend", "?")
+                fallback = res.get("fallback_used", False)
+                tag = f"[cyan]{backend}[/cyan]"
+                if fallback:
+                    tag += " [yellow](fallback)[/yellow]"
+                console.print(f"  TTS backend: {tag}  sample_rate={res.get('sample_rate')}Hz")
+                await tts_client.play_pcm(
+                    res["audio"],
+                    sample_rate=res.get("sample_rate", 24000),
+                )
             console.print()
             continue
         if low == "tts":
