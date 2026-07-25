@@ -20,12 +20,18 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
 from llm_common.db import enqueue_pending, get_pending_status, close_pool, get_producto_nombres_bodega
 from llm_common.nlu import (
     build_alert_context,
     extract_producto,
     normalize_args,
+    normalize_producto,
     parse_confirmacion,
+    parse_escritura_rapida,
     get_producto_nombres_from_candidates,
 )
 from llm_common.schemas import L1_TOOLS, L2_READ, L2_WRITE, L3_ARGS
@@ -256,6 +262,25 @@ def _confirmacion_fast_path(query: str, alert: dict, producto_nombres: set[str] 
     return [], " | ".join(raw)
 
 
+def _regex_write_fast_path(query: str, producto_nombres: set[str]) -> ToolCall | None:
+    """Escritura determinista sin modelo ("añade 5 kilos de papa").
+
+    Solo dispara si el producto resuelve contra el catalogo; si no, se
+    deja que el pipeline del modelo lo intente.
+    """
+    fp = parse_escritura_rapida(query)
+    if not fp:
+        return None
+    prod = normalize_producto(fp["producto"], producto_nombres)
+    if not prod:
+        return None
+    return ToolCall(name=fp["tool"], arguments={
+        "producto": prod,
+        "cantidad": fp["cantidad"],
+        "unidad": fp["unidad"] or "",
+    })
+
+
 async def _run_inference(query: str, producto_nombres: set[str] | None = None) -> tuple[list[ToolCall], str]:
     """Ejecuta el pipeline L1/L2/L3 con un semaforo para limitar concurrencia."""
     assert _infer_sem is not None
@@ -343,15 +368,20 @@ async def infer(req: InferRequest):
     session_id = req.session_id or "default"
     t0 = time.time()
 
-    producto_nombres: set[str] = set()
-    if req.bodega_id:
-        candidatos = await get_producto_nombres_bodega(req.bodega_id)
-        producto_nombres = get_producto_nombres_from_candidates(candidatos)
+    #  Catalogo SIEMPRE: de la bodega si viene, global si no. Sin catalogo
+    #  la normalizacion no resuelve ningun producto y toda escritura moria
+    #  en el enqueue con producto ''.
+    candidatos = await get_producto_nombres_bodega(req.bodega_id)
+    producto_nombres = get_producto_nombres_from_candidates(candidatos)
 
     if req.pending_alert:
         calls, raw = _confirmacion_fast_path(req.query, req.pending_alert, producto_nombres)
     else:
-        calls, raw = await _run_inference(req.query, producto_nombres)
+        fp_call = _regex_write_fast_path(req.query, producto_nombres)
+        if fp_call is not None:
+            calls, raw = [fp_call], f"regex:{fp_call.name}"
+        else:
+            calls, raw = await _run_inference(req.query, producto_nombres)
 
     dt_ms = int((time.time() - t0) * 1000)
     logger.info("infer %dms session=%s calls=%s", dt_ms, session_id, [(c.name, c.arguments) for c in calls])
@@ -360,12 +390,12 @@ async def infer(req: InferRequest):
     for call in calls:
         try:
             if call.name in ("agregar_inventario", "remover_inventario", "confirmar_movimiento"):
-pid = await enqueue_pending(
-                        session_id=session_id,
-                        tool_name=call.name,
-                        arguments=call.arguments,
-                        bodega_id=req.bodega_id,
-                    )
+                pid = await enqueue_pending(
+                    session_id=session_id,
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    bodega_id=req.bodega_id,
+                )
                 pending.append(PendingCall(pending_id=pid, tool_name=call.name, arguments=call.arguments))
                 logger.info("enqueued pending_id=%d tool=%s args=%s", pid, call.name, call.arguments)
             else:

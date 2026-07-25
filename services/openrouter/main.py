@@ -15,8 +15,24 @@ import httpx
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from llm_common.db import enqueue_pending, get_pending_status, close_pool
-from llm_common.nlu import build_alert_context, normalize_args, parse_confirmacion
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
+from llm_common.db import (
+    close_pool,
+    enqueue_pending,
+    get_pending_status,
+    get_producto_nombres_bodega,
+)
+from llm_common.nlu import (
+    build_alert_context,
+    get_producto_nombres_from_candidates,
+    normalize_args,
+    normalize_producto,
+    parse_confirmacion,
+    parse_escritura_rapida,
+)
 from llm_common.schemas import TOOLS_OPENAI
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -24,7 +40,9 @@ logger = logging.getLogger("openrouter-service")
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "anthropic/claude-3.5-haiku")
+# Default: DeepSeek V4 Flash — smart, tool calling solido, ~$0.09/M in.
+# Alternativa gratis: google/gemma-4-31b-it:free
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
 SYSTEM_PROMPT = os.getenv(
     "OPENROUTER_SYSTEM_PROMPT",
     "Eres un asistente de inventario en español. Hablas de forma natural y breve.",
@@ -52,6 +70,7 @@ class InferRequest(BaseModel):
     session_id: str | None = None
     mode: str = "full"
     pending_alert: dict | None = None  # alerta Kalman activa en la sesion
+    bodega_id: int | None = None
 
 
 class ToolCall(BaseModel):
@@ -137,6 +156,11 @@ async def infer(req: InferRequest):
     session_id = req.session_id or "default"
     t0 = time.time()
 
+    #  Catalogo siempre (bodega o global): sin el, normalize_args no
+    #  resuelve productos y toda escritura moria en el enqueue.
+    candidatos = await get_producto_nombres_bodega(req.bodega_id)
+    producto_nombres = get_producto_nombres_from_candidates(candidatos)
+
     alert_pid = 0
     if req.pending_alert:
         #  Con alerta activa: regex determinista primero; el modelo solo
@@ -151,7 +175,15 @@ async def infer(req: InferRequest):
         else:
             calls, raw = await _call_openrouter(build_alert_context(req.query, req.pending_alert))
     else:
-        calls, raw = await _call_openrouter(req.query)
+        fp = parse_escritura_rapida(req.query)
+        fp_prod = normalize_producto(fp["producto"], producto_nombres) if fp else ""
+        if fp and fp_prod:
+            #  Escritura determinista: ni llamada a la API externa
+            calls = [ToolCall(name=fp["tool"], arguments={
+                "producto": fp_prod, "cantidad": fp["cantidad"], "unidad": fp["unidad"] or ""})]
+            raw = f"regex:{fp['tool']}"
+        else:
+            calls, raw = await _call_openrouter(req.query)
 
     dt_ms = int((time.time() - t0) * 1000)
     logger.info("infer %dms session=%s calls=%s", dt_ms, session_id, [(c.name, c.arguments) for c in calls])
@@ -159,7 +191,7 @@ async def infer(req: InferRequest):
     normalized: list[ToolCall] = []
     pending: list[PendingCall] = []
     for call in calls:
-        args = normalize_args(call.name, call.arguments, req.query)
+        args = normalize_args(call.name, call.arguments, req.query, producto_nombres)
         if call.name == "confirmar_movimiento" and alert_pid > 0:
             args["pending_id"] = alert_pid  # el id real es el del estado, no del modelo
         normalized.append(ToolCall(name=call.name, arguments=args))
@@ -169,6 +201,7 @@ async def infer(req: InferRequest):
                     session_id=session_id,
                     tool_name=call.name,
                     arguments=args,
+                    bodega_id=req.bodega_id,
                 )
                 pending.append(PendingCall(pending_id=pid, tool_name=call.name, arguments=args))
                 logger.info("enqueued pending_id=%d tool=%s", pid, call.name)

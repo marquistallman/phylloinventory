@@ -1,6 +1,9 @@
 # Dependencias del cliente CLI (thin client).
 # La mayoria de la logica ahora vive en los microservicios Docker.
 
+# Config desde .env / .env.example (con python-dotenv)
+python-dotenv>=1.0
+
 # HTTP + WebSocket
 httpx>=0.25
 websockets>=12

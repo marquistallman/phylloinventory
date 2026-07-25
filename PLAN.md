@@ -1,6 +1,6 @@
 # Phylloinventory — Documentacion de Implementacion
 
-## Estado: Fases 1-6 completadas
+## Estado: Fases 1-7 completadas
 
 ---
 
@@ -36,16 +36,18 @@
                               └──────────┘
 ```
 
-### Servicios Docker (6 containers)
+### Servicios Docker (8 containers)
 
 | Servicio | Puerto | Perfil | Rol |
 |---|---|---|---|
 | `postgres` | 5432 | default | DB + cola + funciones Kalman puras |
 | `kalman-worker` | 8300 | default | Go, consume `pending_evaluations`, 8 goroutines |
 | `needle-service` | 8081 | default | Needle 26M, L1→L2→L3 pipeline, fuzzy search |
-| `api-gateway` | 8200 | default | Router central, 15 endpoints |
-| `openrouter-service` | 8082 | with-openrouter | Alternativa: Claude 3.5 Haiku via OpenRouter |
-| `voice-service` | 8100 | with-voice | Whisper via WebSocket |
+| `api-gateway` | 8200 | default | Router central, 19 endpoints, toggle cloud runtime |
+| `kokoro-service` | 8205 | default | Kokoro 82M TTS, streaming PCM 24k por oracion |
+| `openrouter-service` | 8082 | with-openrouter | Alternativa: DeepSeek V4 Flash via OpenRouter ($0.09/M in) |
+| `voice-service` | 8100 | with-voice | Whisper local STT via WebSocket |
+| `elevenlabs-service` | 8206 | with-elevenlabs | Eleven Labs STT + TTS cloud (scribe_v1 + eleven_multilingual_v2) |
 
 ---
 
@@ -391,6 +393,26 @@ docker compose --profile with-voice up -d
 
 # Con OpenRouter (Claude 3.5 Haiku) + voz
 docker compose --profile with-openrouter --profile with-voice up -d
+
+# Con Eleven Labs (STT + TTS cloud) — el toggle cloud arranca apagado
+docker compose --profile with-elevenlabs up -d
+
+# Todo cloud (OpenRouter + Eleven Labs) + voz local Whisper de respaldo
+docker compose --profile with-openrouter --profile with-elevenlabs --profile with-voice up -d
+```
+
+Activacion cloud runtime (cambia sin reiniciar):
+
+```bash
+# En la CLI
+> cloud on         # LLM/STT/TTS intentan cloud primero, fallback automatico a local
+> cloud off        # todo local
+> cloud status     # muestra config activa
+> cloud stt=elevenlabs tts=kokoro llm=auto   # override por-backend
+
+# Por HTTP
+curl -X POST http://localhost:8200/api/config -H "Content-Type: application/json" \
+  -d '{"cloud_enabled": true}'
 ```
 
 ---
@@ -405,11 +427,149 @@ El backend expone todos los endpoints que la PWA necesita:
 | Iniciar conteo | `POST /api/sesion/iniciar` |
 | Lista de productos (Tablet) | `GET /api/catalogo/bodega/{id}?sesion_id=X` |
 | Input manual (Tablet) | `POST /api/sesion/registrar-manual` |
-| Grabar voz | `POST /api/sesion/registrar-voz` (enviar texto transcrito) |
-| Transcribir audio | `POST /api/audio/transcribir` (pendiente de implementar — proxy a voice-service) |
+| Grabar voz (texto) | `POST /api/sesion/registrar-voz` (enviar texto transcrito) |
+| **Transcribir audio** | `POST /api/audio/transcribir` (multipart file) — **implementado**, backend-agnostico |
+| **Sintetizar voz** | `POST /api/audio/speak` (json) — **implementado**, backend-agnostico |
+| **Listar voces** | `GET /api/audio/voices` — para selector en PWA |
+| **Toggle cloud** | `GET/POST /api/config` — `{cloud_enabled, llm, stt, tts}` |
 | Barra de progreso | `GET /api/sesion/{id}/estado` (poll cada 2s) |
 | Finalizar conteo | `POST /api/sesion/finalizar` |
 | Reporte final | `GET /api/reporte/diferencias/{id}` |
 | Alertas Kalman | `GET /api/reporte/sospechosos/{id}` |
 
 Para el MVP del hackathon, el audio se puede grabar con `MediaRecorder` API en el navegador y enviar como `multipart/form-data` al endpoint `/api/audio/transcribir` (a implementar como proxy al voice-service).
+
+---
+
+## Fase 7 — Toggle Cloud + Eleven Labs (entrada/salida de voz)
+
+**Fecha: implementacion actual.** El uso constante de la demo es el flujo
+de voz (STT + TTS), asi que se agrega la opcion cloud Eleven Labs con
+toggle runtime y fallback automatico.
+
+### 7.1 Servicio `services/elevenlabs/` (nuevo, ~280 lineas)
+
+Replica el patron de `openrouter-service` con dos endpoints (cloud STT y
+cloud TTS). Sin torch ni torch-deps — solo fastapi + httpx.
+
+| Endpoint | Consume | Devuelve |
+|---|---|---|
+| `POST /transcribe` | multipart `file`, `language_code`, `model_id` | `{text, language, backend, model}` |
+| `POST /speak` | json `{text, voice_id?, model_id?, output_format?}` | stream `audio/pcm` (default `pcm_24000`) |
+| `GET /voices` | — | `{voices: [...], default_voice_id}` (cache 1h server-side) |
+| `GET /health` | — | `{status, has_key, stt_model, tts_model, default_voice, tts_output}` |
+
+TTS a PCM via `output_format=pcm_24000` (int16 LE mono 24kHz) — encaja
+1:1 con `tts_client.py:30` (SAMPLE_RATE=24000, DTYPE=int16). Cero
+decode mp3, cero `pydub`.
+
+### 7.2 Toggle runtime en api-gateway
+
+Estado en memoria (no se persiste entre reinicios — el default vuelve al
+`CLOUD_ENABLED` del `.env`):
+
+```python
+_cloud_toggle: bool = os.getenv("CLOUD_ENABLED", "false").lower() == "true"
+_llm_override: str | None = None
+_stt_override: str | None = None
+_tts_override: str | None = None
+```
+
+Pickers:
+
+```python
+def _pick_llm() -> str:  # "needle" | "openrouter"
+    if _llm_override: return _llm_override
+    return "openrouter" if _cloud_toggle else LLM_BACKEND
+# _pick_stt(), _pick_tts() identicos
+```
+
+Endpoints nuevos:
+
+| Method | Path | Body / Response |
+|---|---|---|
+| `GET` | `/api/config` | `{cloud_enabled, llm, stt, tts, llm_override, stt_override, tts_override, defaults}` |
+| `POST` | `/api/config` | `{cloud_enabled?, llm?, stt?, tts?}` (cada uno: `auto` o el valor canonico) |
+
+### 7.3 Fallback automatico cloud → local
+
+Helper `_post_with_fallback()` aplicado a:
+- `/query` (LLM)
+- `/api/sesion/registrar-voz` (LLM, via internal)
+- `/api/audio/transcribir` (STT)
+- `/api/audio/speak` (TTS)
+
+Si el toggle esta en `true` y el backend cloud retorna error (HTTP no-200,
+timeout, request error) → cae al local. La respuesta incluye:
+
+```json
+{
+  "backend": "local",
+  "backend_requested": "elevenlabs",
+  "fallback_used": true,
+  ...
+}
+```
+
+### 7.4 Proxy STT con ffmpeg
+
+El gateway ahora decodifica cualquier formato de audio (webm, mp3, wav,
+m4a, ogg) a PCM 16k mono con ffmpeg, antes de mandarlo al voice-service
+local. Si el backend activo es Eleven Labs, el archivo pasa tal cual
+(Eleven Labs acepta todos los formatos). ffmpeg se instalo en el
+Dockerfile del api-gateway (apt-get).
+
+### 7.5 Archivos creados/modificados (resumen)
+
+| Archivo | Cambio |
+|---|---|
+| `services/elevenlabs/main.py` | nuevo (~280 lineas): STT, TTS, voices, health |
+| `services/elevenlabs/requirements.txt` | nuevo: fastapi, uvicorn, httpx, python-multipart |
+| `services/elevenlabs/Dockerfile` | nuevo: python:3.11-slim, copia llm_common/ por consistencia |
+| `docker-compose.yml` | +`elevenlabs-service` en perfil `with-elevenlabs`, +vars en api-gateway |
+| `services/api-gateway/Dockerfile` | +ffmpeg (apt-get) para decode audio |
+| `services/api-gateway/requirements.txt` | +websockets, +python-multipart |
+| `services/api-gateway/main.py` | +`/api/config` (GET/POST), +`/api/audio/{transcribir,speak,voices}`, fallback automatico en `/query` y `/api/sesion/registrar-voz`, `+STT_BACKEND`/`+TTS_BACKEND` env, `+CLOUD_ENABLED` toggle, helper `_post_with_fallback()` y `_ffmpeg_to_pcm16k()` |
+| `src/api_client.py` | +`get_config()`, +`set_config()`, +`transcribe_audio()`, +`speak_remote()`, +`list_voices()` |
+| `src/voice_client.py` | reescrito: graba a .wav temp y POSTea al gateway (sin WebSocket directo) |
+| `src/tts_client.py` | +`play_pcm()` para reproducir buffers PCM ya recibidos (usado por `tts` via gateway) |
+| `src/cli.py` | comandos `cloud on/off/status` y `cloud llm=... stt=... tts=...`, comando `voices`, banner muestra los 3 backends activos + tag `[CLOUD]`, comando `tts` ahora va por el gateway con fallback |
+| `.env.example` | nuevo: documenta todas las vars nuevas |
+
+### 7.6 Comandos nuevos de la CLI
+
+| Comando | Descripcion |
+|---|---|
+| `cloud on` | Activa todos los backends cloud (LLM, STT, TTS) con fallback automatico |
+| `cloud off` | Vuelve a todo local |
+| `cloud status` | Muestra `{cloud_enabled, llm, stt, tts, *_override, defaults}` |
+| `cloud llm=openrouter stt=whisper tts=elevenlabs` | Override por-backend (cualquier combinacion; usar `auto` para volver al toggle) |
+| `voices` | Lista las voces disponibles del backend TTS activo (proxy a Eleven Labs si esta activo) |
+
+### 7.7 Variables de entorno nuevas
+
+| Var | Default | Notas |
+|---|---|---|
+| `STT_BACKEND` | `whisper` | `whisper` o `elevenlabs` (default si no hay override ni toggle) |
+| `TTS_BACKEND` | `kokoro` | `kokoro` o `elevenlabs` |
+| `CLOUD_ENABLED` | `false` | Toggle global al arranque (luego `cloud on/off` en runtime) |
+| `ELEVENLABS_API_KEY` | vacio | Requerida para que elevenlabs-service funcione |
+| `ELEVENLABS_VOICE_ID` | `21m00Tcm4TlvDq8ikWAM` (Rachel) | Default; el endpoint `/api/audio/speak` acepta `voice_id` en el body |
+| `ELEVENLABS_STT_MODEL` | `scribe_v1` | |
+| `ELEVENLABS_TTS_MODEL` | `eleven_multilingual_v2` | |
+| `ELEVENLABS_TTS_OUTPUT` | `pcm_24000` | PCM int16 LE mono 24k para match con tts_client.py |
+
+### 7.8 Para usar la PWA con cloud
+
+1. Levantar con perfil cloud:
+   ```bash
+   ELEVENLABS_API_KEY=sk_xxx OPENROUTER_API_KEY=sk-xxx \
+     docker compose --profile with-elevenlabs --profile with-openrouter up -d
+   ```
+2. Activar runtime (sin reiniciar):
+   ```bash
+   curl -X POST http://localhost:8200/api/config -d '{"cloud_enabled": true}' -H "Content-Type: application/json"
+   ```
+3. La PWA consume `/api/audio/transcribir` para STT y `/api/audio/speak`
+   para TTS sin saber que backend esta activo. `GET /api/audio/voices`
+   alimenta el selector de voces.

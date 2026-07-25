@@ -73,6 +73,22 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
 
     try:
         with conn.cursor() as cur:
+            # 0. Verificar que las tablas existen (init.sql se haya corrido)
+            cur.execute("""
+                SELECT table_name FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name IN ('bodegas', 'productos', 'stock', 'unidades')
+            """)
+            tables = {r[0] for r in cur.fetchall()}
+            missing = {"bodegas", "productos", "stock", "unidades"} - tables
+            if missing:
+                raise RuntimeError(
+                    f"Tablas faltantes en DB: {sorted(missing)}. "
+                    f"Ejecuta db/init.sql contra la base de datos "
+                    f"(ej: docker compose down -v && docker compose up, "
+                    f"o: docker exec -i cactus_postgres psql -U cactus -d inventario < db/init.sql)."
+                )
+
             # 1. Importar bodegas desde hoja "BODEGAS DISPONIBLES"
             ws_bodegas = wb["BODEGAS DISPONIBLES"]
             bodegas_vistas: set[str] = set()
@@ -87,7 +103,6 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                 nombre = str(row[2]).strip().lower() if row[2] else ""
                 if not nombre or nombre in bodegas_vistas:
                     continue
-                bodegas_vistas.add(nombre)
                 try:
                     cur.execute(
                         "INSERT INTO bodegas (nombre) VALUES (%s) ON CONFLICT (nombre) DO UPDATE SET nombre=EXCLUDED.nombre RETURNING id",
@@ -95,29 +110,37 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                     )
                     bid = cur.fetchone()[0]
                     bodega_id_map[nombre] = bid
+                    bodegas_vistas.add(nombre)
                     stats["bodegas"] += 1
-                except Exception:
+                except Exception as e:
                     stats["errores"] += 1
+                    print(f"  [ERROR] bodega '{nombre}': {e}")
 
             # Tambien registrar bodegas del mapeo HOJA_A_BODEGA si no existen
             for bname in HOJA_A_BODEGA.values():
-                if bname not in bodegas_vistas:
+                if bname in bodegas_vistas:
+                    continue
+                try:
+                    cur.execute(
+                        "INSERT INTO bodegas (nombre) VALUES (%s) ON CONFLICT (nombre) DO UPDATE SET nombre=EXCLUDED.nombre RETURNING id",
+                        (bname,),
+                    )
+                    bid = cur.fetchone()[0]
+                    bodega_id_map[bname] = bid
                     bodegas_vistas.add(bname)
-                    try:
-                        cur.execute(
-                            "INSERT INTO bodegas (nombre) VALUES (%s) ON CONFLICT (nombre) DO UPDATE SET nombre=EXCLUDED.nombre RETURNING id",
-                            (bname,),
-                        )
-                        bid = cur.fetchone()[0]
-                        bodega_id_map[bname] = bid
-                        stats["bodegas"] += 1
-                    except Exception:
-                        stats["errores"] += 1
+                    stats["bodegas"] += 1
+                except Exception as e:
+                    stats["errores"] += 1
+                    print(f"  [ERROR] bodega '{bname}': {e}")
+
+            # Cache de unidades (lookup por nombre -> id)
+            cur.execute("SELECT id, nombre FROM unidades")
+            unidad_id_map: dict[str, int] = {r[1]: r[0] for r in cur.fetchall()}
 
             conn.commit()
             print(f"  Bodegas importadas: {stats['bodegas']}")
 
-            # 2. Importar stock desde las 8 hojas de productos
+            # 2. Importar productos + stock desde las 8 hojas
             for sheet_name, bodega_nombre in HOJA_A_BODEGA.items():
                 if sheet_name not in wb.sheetnames:
                     print(f"  [AVISO] Hoja '{sheet_name}' no encontrada, saltando")
@@ -129,8 +152,11 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                     continue
 
                 ws = wb[sheet_name]
-                rows_data: list[dict] = []
-                errores_hoja = 0
+                # Acumulamos: upsert en productos (catalogo) y luego en stock
+                # (per-bodega). Lo hacemos en dos pasadas para evitar
+                # conflictos con UNIQUE en (nombre) al re-correr.
+                productos_rows: list[tuple] = []
+                stock_rows: list[tuple] = []
 
                 for row in ws.iter_rows(min_row=3, values_only=True):
                     if not row or len(row) < 5:
@@ -138,7 +164,7 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                     # Col A=CANTIDAD(row counter), B=Nr.Articulo, C=Articulo, D=Unidad, E=SD
                     codigo = _parse_articulo(row[1]) if len(row) > 1 else None
                     nombre = str(row[2]).strip() if len(row) > 2 and row[2] else ""
-                    unidad = normalizar_unidad(str(row[3])) if len(row) > 3 and row[3] else "Unidad"
+                    unidad_nombre = normalizar_unidad(str(row[3])) if len(row) > 3 and row[3] else "Unidad"
                     try:
                         sd = float(row[4]) if len(row) > 4 and row[4] is not None else 0.0
                     except (ValueError, TypeError):
@@ -147,36 +173,51 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                     if not nombre:
                         continue
 
-                    rows_data.append({
-                        "nombre": nombre,
-                        "codigo_articulo": codigo,
-                        "unidad": unidad,
-                        "stock_actual": sd,
-                        "media_kalman": sd,
-                    })
+                    unidad_id = unidad_id_map.get(unidad_nombre)
+                    if unidad_id is None:
+                        cur.execute(
+                            "INSERT INTO unidades (nombre) VALUES (%s) ON CONFLICT (nombre) DO UPDATE SET nombre=EXCLUDED.nombre RETURNING id",
+                            (unidad_nombre,),
+                        )
+                        unidad_id = cur.fetchone()[0]
+                        unidad_id_map[unidad_nombre] = unidad_id
 
-                # Batch insert con ON CONFLICT
-                if rows_data:
+                    productos_rows.append((nombre, codigo, unidad_id))
+                    stock_rows.append((nombre, codigo, unidad_id, bodega_id, sd))
+
+                # 2a. Upsert en catalogo productos
+                if productos_rows:
                     execute_values(
                         cur,
                         """
-                        INSERT INTO productos (nombre, bodega_id, codigo_articulo, unidad, stock_actual, media_kalman)
+                        INSERT INTO productos (nombre, codigo_articulo, unidad_id)
                         VALUES %s
-                        ON CONFLICT (nombre, bodega_id)
-                        DO UPDATE SET
+                        ON CONFLICT (nombre) DO UPDATE SET
                             codigo_articulo = EXCLUDED.codigo_articulo,
-                            unidad = EXCLUDED.unidad,
-                            stock_actual = EXCLUDED.stock_actual,
-                            media_kalman = EXCLUDED.media_kalman
+                            unidad_id       = EXCLUDED.unidad_id
                         """,
-                        [
-                            (r["nombre"], bodega_id, r["codigo_articulo"], r["unidad"], r["stock_actual"], r["media_kalman"])
-                            for r in rows_data
-                        ],
-                        template="(%s, %s, %s, %s, %s, %s)",
+                        productos_rows,
+                        template="(%s, %s, %s)",
                     )
-                    stats["productos"] += len(rows_data)
-                stats["errores"] += errores_hoja
+
+                # 2b. Upsert en stock (per-bodega)
+                if stock_rows:
+                    execute_values(
+                        cur,
+                        """
+                        INSERT INTO stock (producto_id, bodega_id, stock_actual, media_kalman, varianza_kalman)
+                        SELECT p.id, s.bodega_id, s.sd, s.sd, 100.0
+                        FROM (VALUES %s) AS s(nombre, codigo, unidad_id, bodega_id, sd)
+                        JOIN productos p ON p.nombre = s.nombre
+                        ON CONFLICT (producto_id, bodega_id) DO UPDATE SET
+                            stock_actual   = EXCLUDED.stock_actual,
+                            media_kalman   = EXCLUDED.media_kalman,
+                            actualizado_en = NOW()
+                        """,
+                        stock_rows,
+                        template="(%s, %s, %s, %s, %s)",
+                    )
+                    stats["productos"] += len(stock_rows)
 
             conn.commit()
 

@@ -1,0 +1,171 @@
+# =====================================================================
+#  Cactus Inventory — .gitignore
+# =====================================================================
+
+# ----- Python -----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtualenvs
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.python-version
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.cache
+nosetests.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+
+# Jupyter
+.ipynb_checkpoints
+profile_default/
+
+# ----- Go (kalman-worker) -----
+# Binarios de Go: el binario sale con `go build` al Dockerfile
+*.exe
+*.exe~
+*.dll
+*.dylib
+# Test binarios
+*.test
+*.out
+# Go workspace
+go.work
+go.work.sum
+
+# ----- Node / JS (por si se agrega PWA aca) -----
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+
+# ----- Docker / volumenes -----
+# Datos de Postgres y checkpoints de Needle viven en named volumes
+# (pgdata, needle_checkpoints) — no se persisten en el repo. Pero por si
+# alguien monta un bind-mount local:
+docker-data/
+.pgdata/
+.needle_checkpoints/
+
+# ----- Modelos / pesos / caches grandes -----
+checkpoints/
+*.pkl
+*.pt
+*.pth
+*.onnx
+*.bin
+*.safetensors
+models/
+
+# ----- Audio / video efimero (grabaciones, TTS outputs) -----
+*.wav
+*.mp3
+*.ogg
+*.m4a
+*.flac
+*.webm
+recordings/
+tmp_audio/
+
+# ----- Documentos / datos del proyecto -----
+# Ignoramos los archivos de datos reales (Excel con stock, docs del reto)
+# para no commitear data de clientes. Si queres versionarlos, hace `git add -f`.
+*.xlsx
+*.docx
+*.pdf
+data/
+
+# ----- Secrets y config local -----
+# .env.example SI se commitea (es la plantilla). Los .env reales NO.
+.env
+.env.local
+.env.*.local
+.envrc
+*.pem
+*.key
+secrets/
+
+# ----- Logs -----
+*.log
+logs/
+*.pid
+*.seed
+*.pid.lock
+
+# ----- IDEs / editores -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*.sw[a-z]
+*._*
+.project
+.classpath
+.settings/
+nbproject/
+nbbuild/
+nbdist/
+
+# ----- OS -----
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ----- Build / coverage reports -----
+*.gcov
+*.gcda
+*.gcno
+*.orig
+
+# ----- Coqui / TTS / Whisper caches -----
+.tts_cache/
+.whisper_cache/
+.espeak-ng-data/
+
+# ----- Testing artifacts (scripts/_test_*.py generan archivos) -----
+test_output/
+*.test.wav
+*.test.mp3
+test_*.log

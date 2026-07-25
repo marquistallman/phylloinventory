@@ -18,10 +18,15 @@ import json
 import logging
 import os
 import time
+from contextlib import asynccontextmanager
 from typing import Any
 
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("voice-service")
@@ -34,21 +39,48 @@ SILENCE_SECS = float(os.getenv("VOICE_SILENCE_SECS", "0.8"))
 MIN_UTTERANCE_SECS = float(os.getenv("VOICE_MIN_UTTERANCE", "0.5"))
 MAX_BUFFER_SECS = float(os.getenv("VOICE_MAX_BUFFER", "30"))
 
-app = FastAPI(title="voice-service", version="1.0.0")
-
-_model_lock = asyncio.Lock()
 _model: Any = None
+_model_ready: asyncio.Event | None = None
 
 
-async def get_model():
+def _load_model_sync() -> Any:
+    """Carga bloqueante — se ejecuta en thread para no trabar el event loop."""
+    from faster_whisper import WhisperModel
+    logger.info("Cargando Whisper %s (cpu, int8) ...", MODEL_SIZE)
+    m = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
+    logger.info("Whisper listo.")
+    return m
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Arranque: pre-carga el modelo en background para no bloquear uvicorn.
+
+    Si se cargara dentro del handler del WS, la primera conexion quedaria
+    pegada ~30-60s mientras Whisper descarga pesos, y ademas bloquearia el
+    event loop (WhisperModel es sync). Durante esa ventana, el resto de
+    conexiones WS nuevas ven 'timed out during opening handshake'.
+    """
+    global _model, _model_ready
+    _model_ready = asyncio.Event()
+    asyncio.get_event_loop().run_in_executor(None, _set_model_when_loaded)
+    yield
+    #  Nada que cerrar: el modelo se libera con el proceso.
+
+
+def _set_model_when_loaded() -> None:
     global _model
-    async with _model_lock:
-        if _model is None:
-            from faster_whisper import WhisperModel
-            logger.info("Cargando Whisper %s (cpu, int8) ...", MODEL_SIZE)
-            _model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
-            logger.info("Whisper listo.")
-        return _model
+    try:
+        _model = _load_model_sync()
+    except Exception as e:
+        logger.exception("Fallo cargando Whisper: %s", e)
+        return
+    #  Avisar al event loop que el modelo esta listo
+    if _model_ready is not None:
+        _model_ready.set()
+
+
+app = FastAPI(title="voice-service", version="1.0.0", lifespan=lifespan)
 
 
 def _rms(int16_samples: np.ndarray) -> float:
@@ -56,6 +88,20 @@ def _rms(int16_samples: np.ndarray) -> float:
         return 0.0
     f = int16_samples.astype(np.float32) / 32768.0
     return float(np.sqrt(np.mean(f * f) + 1e-12))
+
+
+async def _wait_model(timeout_s: float = 120.0) -> Any:
+    """Espera (sin bloquear el event loop) a que el modelo este listo."""
+    if _model is not None:
+        return _model
+    assert _model_ready is not None
+    try:
+        await asyncio.wait_for(_model_ready.wait(), timeout=timeout_s)
+    except asyncio.TimeoutError:
+        raise RuntimeError("Whisper aun no esta listo (timeout)")
+    if _model is None:
+        raise RuntimeError("Whisper fallo al cargar; revisa los logs del contenedor")
+    return _model
 
 
 async def _transcribe(model, audio_f32: np.ndarray) -> str:
@@ -89,8 +135,16 @@ async def ws_transcribe(ws: WebSocket):
     await ws.accept()
     logger.info("ws client connected")
 
-    #  Carga lazy del modelo en la primera conexion.
-    model = await get_model()
+    try:
+        model = await _wait_model(timeout_s=120.0)
+    except Exception as e:
+        logger.error("Modelo no disponible: %s", e)
+        try:
+            await ws.send_json({"type": "error", "message": str(e)})
+        except Exception:
+            pass
+        await ws.close()
+        return
 
     buffer = bytearray()
     last_voice_ts = time.time()

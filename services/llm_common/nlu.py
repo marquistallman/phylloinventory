@@ -220,6 +220,9 @@ def parse_investigacion_rapida(texto: str) -> dict | None:
         if pat.search(t):
             return {"tool": "investigar_sospechosos", "producto": None}
     return None
+
+
+def extract_unidad(texto: str) -> str | None:
     """Extrae la primera mencion de unidad en el texto."""
     m = _UNIDAD_REGEX.search(texto)
     if m:
