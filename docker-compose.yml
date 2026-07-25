@@ -5,13 +5,16 @@
 #    default (sin profile) -> postgres, kalman-worker, needle-service, api-gateway
 #    --profile with-voice      -> agrega voice-service
 #    --profile with-openrouter -> agrega openrouter-service y lo selecciona como backend
+#    --profile with-elevenlabs -> agrega elevenlabs-service (TTS via ElevenLabs API)
 #
 #  Uso:
 #    docker compose up -d                              # minimo (needle)
 #    docker compose --profile with-voice up -d         # + voz
 #    docker compose --profile with-openrouter --profile with-voice up -d  # todo
+#    docker compose --profile with-elevenlabs up -d    # TTS via ElevenLabs
 #
 #  LLM_BACKEND=needle|openrouter cambia el backend por env (default needle)
+#  ELEVENLABS_API_KEY=... necesario para el perfil with-elevenlabs
 # =====================================================================
 
 x-logging: &default-logging
@@ -127,6 +130,8 @@ services:
       LLM_BACKEND: ${LLM_BACKEND:-needle}
       NEEDLE_URL: http://needle-service:8081
       OPENROUTER_URL: http://openrouter-service:8082
+      KOKORO_URL: http://kokoro-service:8205
+      ELEVENLABS_URL: http://elevenlabs-service:8206
     depends_on:
       postgres:
         condition: service_healthy
@@ -136,6 +141,45 @@ services:
         condition: service_started
     ports:
       - "8200:8200"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  kokoro-service — TTS (Kokoro 82M/84M, streaming por oracion)
+  # -------------------------------------------------------------------
+  kokoro-service:
+    build:
+      context: .
+      dockerfile: services/kokoro_svc/Dockerfile
+    container_name: cactus_kokoro
+    environment:
+      LANG_CODE: ${KOKORO_LANG:-e}      # 'e' = espanol
+      VOICE:     ${KOKORO_VOICE:-ef_dora}
+      SPEED:     ${KOKORO_SPEED:-1.0}
+      PORT:      "8205"
+    ports:
+      - "8205:8205"
+    networks:
+      - cactus_net
+    logging: *default-logging
+
+  # -------------------------------------------------------------------
+  #  elevenlabs-service — TTS via ElevenLabs API (perfil with-elevenlabs)
+  # -------------------------------------------------------------------
+  elevenlabs-service:
+    profiles: ["with-elevenlabs"]
+    build:
+      context: .
+      dockerfile: services/elevenlabs_svc/Dockerfile
+    container_name: cactus_elevenlabs
+    environment:
+      ELEVENLABS_API_KEY: ${ELEVENLABS_API_KEY:-}
+      ELEVENLABS_VOICE: ${ELEVENLABS_VOICE:-9BWtsMINqrJLrRakOkie}
+      ELEVENLABS_MODEL: ${ELEVENLABS_MODEL:-eleven_multilingual_v2}
+      TARGET_SAMPLERATE: "24000"
+    ports:
+      - "8206:8206"
     networks:
       - cactus_net
     logging: *default-logging
