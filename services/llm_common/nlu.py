@@ -151,6 +151,77 @@ def parse_escritura_rapida(texto: str) -> dict | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+#  Fast path: lecturas (consultas de inventario, sin escritura)
+# ---------------------------------------------------------------------------
+
+_READ_PATTERNS: list[tuple[re.Pattern, bool]] = [
+    # "cuanto hay de aceite", "cuantas cebollas tenemos"
+    (re.compile(r"cu[áa]nt[oa]s?\s+(?:hay|tenemos|quedan)(?:\s+(?:de|en)\s+)?(?P<producto>.+?)\s*$", re.IGNORECASE), True),
+    # "cuanto aceite hay"
+    (re.compile(r"cu[áa]nt[oa]s?\s+(?P<producto>.+?)\s+(?:hay|tenemos|quedan)\s*$", re.IGNORECASE), True),
+    # "consulta aceite", "consultar inventario de pan"
+    (re.compile(r"consulta[r]?\s+(?:stock|inventario|producto\s+)?(?:de\s+)?(?P<producto>.+?)\s*$", re.IGNORECASE), True),
+    # "ver stock de aceite", "ver inventario"
+    (re.compile(r"ver\s+(?:stock|inventario)(?:\s+(?:de\s+)?(?P<producto>.+?))?\s*$", re.IGNORECASE), True),
+    # "que hay", "que tenemos"
+    (re.compile(r"qu[ée]\s+(?:hay|tenemos|queda)(?:\s+en\s+(?:el\s+)?inventario)?\s*$", re.IGNORECASE), False),
+    (re.compile(r"qu[ée]\s+(?:hay|tenemos)\s+(?:de\s+)?(?P<producto>.+?)\s*$", re.IGNORECASE), True),
+    # "mostrame inventario", "dame stock de X"
+    (re.compile(r"(?:mostr(?:ar?|a)|dame)\s+(?:el\s+)?(?:inventario|stock)(?:\s+(?:de\s+)?(?P<producto>.+?))?\s*$", re.IGNORECASE), True),
+    # "inventario" solo
+    (re.compile(r"^(?:inventario|stock|cat[aá]logo)\s*$", re.IGNORECASE), False),
+]
+
+# ---------------------------------------------------------------------------
+#  Fast path: investigacion / auditoria
+# ---------------------------------------------------------------------------
+
+_INVESTIGATE_PATTERNS: list[re.Pattern] = [
+    re.compile(r"(?:hay\s+)?algo\s+raro\b", re.IGNORECASE),
+    re.compile(r"\binvestig(?:ar?|a)\b", re.IGNORECASE),
+    re.compile(r"\baudit(?:ar?|a)\b", re.IGNORECASE),
+    re.compile(r"\bsospechos[oa]s?\b", re.IGNORECASE),
+    re.compile(r"\bdiscrepancias?\b", re.IGNORECASE),
+    re.compile(r"\banomal[íi]as?\b", re.IGNORECASE),
+    re.compile(r"(?:revisa[r]?|mira[r]?|checa[r]?)\s+(?:si\s+hay\s+)?(?:sospechosos?|errores?|anomal[íi]as?)", re.IGNORECASE),
+    re.compile(r"\berrores?\s+(?:de|del)\s+inventario\b", re.IGNORECASE),
+]
+
+
+def parse_lectura_rapida(texto: str) -> dict | None:
+    """Fast path determinista para lecturas: consultas de stock/inventario.
+
+    Retorna {"tool": "consultar_inventario", "producto": str|None}
+    o None si no matchea.
+    """
+    t = texto.strip()
+    for pat, has_prod in _READ_PATTERNS:
+        m = pat.search(t)
+        if m:
+            prod = None
+            if has_prod:
+                try:
+                    prod = m.group("producto").strip().rstrip(".,;!?")
+                except IndexError:
+                    prod = None
+            return {"tool": "consultar_inventario", "producto": prod or None}
+    return None
+
+
+def parse_investigacion_rapida(texto: str) -> dict | None:
+    """Fast path determinista para investigacion/auditoria.
+
+    Retorna {"tool": "investigar_sospechosos", "producto": None}
+    o None si no matchea.
+    """
+    t = texto.strip()
+    for pat in _INVESTIGATE_PATTERNS:
+        if pat.search(t):
+            return {"tool": "investigar_sospechosos", "producto": None}
+    return None
+
+
 def extract_unidad(texto: str) -> str | None:
     """Extrae la primera mencion de unidad en el texto."""
     m = _UNIDAD_REGEX.search(texto)
