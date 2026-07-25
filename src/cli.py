@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import sys
 import uuid
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger("cli")
 from rich.align import Align
 from rich import box as _box_module
 from rich.console import Console
@@ -66,8 +69,11 @@ def show_banner(backend: str, voice_ok: bool = False, config: dict | None = None
     llm = cfg.get("llm", backend)
     stt = cfg.get("stt", "?")
     tts = cfg.get("tts", "?")
+    narrator = cfg.get("narrator", "default")
+    narrator_model = cfg.get("narrator_model", "")
     cloud = cfg.get("cloud_enabled", False)
     cloud_tag = " [bold magenta]CLOUD[/bold magenta]" if cloud else ""
+    n_color = "magenta" if narrator == "llm" else "cyan"
 
     voice_line = (
         "[green]Voz: OK (microfono disponible)[/green]"
@@ -77,7 +83,11 @@ def show_banner(backend: str, voice_ok: bool = False, config: dict | None = None
     backends_line = (
         f"[dim]LLM: [bold cyan]{llm}[/bold cyan]  "
         f"STT: [bold cyan]{stt}[/bold cyan]  "
-        f"TTS: [bold cyan]{tts}[/bold cyan][/dim]{cloud_tag}"
+        f"TTS: [bold cyan]{tts}[/bold cyan]  "
+        f"Narrator: [{n_color}]{narrator}[/{n_color}][/dim]{cloud_tag}"
+    )
+    narrator_model_line = (
+        f"[dim]  Narrator model: [cyan]{narrator_model}[/cyan][/dim]\n" if narrator_model else ""
     )
     panel = Panel(
         Align.center(
@@ -85,20 +95,23 @@ def show_banner(backend: str, voice_ok: bool = False, config: dict | None = None
                 "[bold green]Cactus Inventory - Microservicios[/bold green]\n"
                 f"Session: [dim]{SESSION_ID}[/dim]\n"
                 f"{backends_line}\n"
+                f"{narrator_model_line}"
                 f"[dim]{voice_line}[/dim]\n"
                 "[dim]Kalman evaluado por worker Go - Cola en PostgreSQL[/dim]\n\n"
                 "[yellow]Comandos:[/yellow]\n"
-                "  texto libre             -> enviar al LLM\n"
-                "  voz                     -> dictar por microfono\n"
-                "  tts <texto>             -> probar TTS (sintetiza y reproduce)\n"
-                "  cloud on|off|status     -> toggle cloud (Eleven Labs + OpenRouter)\n"
-                "  voices                  -> listar voces Eleven Labs disponibles\n"
-                "  inventario              -> ver catalogo (1 fila x producto)\n"
-                "  inventario <bodega>     -> stock por bodega\n"
-                "  sospechosos [producto]  -> auditoria Kalman\n"
-                "  salir / exit / q        -> cerrar\n"
-                "  ayuda / help            -> mostrar este banner\n"
-                "  limpiar / clear         -> limpiar pantalla"
+                "  texto libre              -> enviar al LLM\n"
+                "  voz                      -> dictar por microfono\n"
+                "  tts <texto>              -> probar TTS (sintetiza y reproduce)\n"
+                "  narrate <event> k=v...   -> probar narrador (templates vs LLM)\n"
+                "  cloud on|off|status      -> toggle cloud (Eleven Labs + OpenRouter)\n"
+                "  voices                   -> listar voces Eleven Labs disponibles\n"
+                "  models [all|select <slug>] -> listar/seleccionar modelos OpenRouter\n"
+                "  inventario               -> ver catalogo (1 fila x producto)\n"
+                "  inventario <bodega>      -> stock por bodega\n"
+                "  sospechosos [producto]   -> auditoria Kalman\n"
+                "  salir / exit / q         -> cerrar\n"
+                "  ayuda / help             -> mostrar este banner\n"
+                "  limpiar / clear          -> limpiar pantalla"
             ),
             vertical="middle",
         ),
@@ -154,7 +167,9 @@ RISK_COLORS = {"CRITICO": "red", "ALTO": "yellow", "MEDIO": "dim cyan", "BAJO": 
 
 
 # =====================================================================
-#  Narracion TTS (kokoro-service). Fire-and-forget: nunca bloquea el loop.
+#  Narracion TTS (kokoro/elevenlabs). Fire-and-forget: nunca bloquea el loop.
+#  El TEXTO se pide al gateway (/api/narrate) — el decide si usa templates
+#  hardcodeados o un LLM para reformular (default: google/gemma-4-31b-it:free).
 # =====================================================================
 
 def _narrate(phrase: str) -> None:
@@ -166,11 +181,46 @@ def _narrate(phrase: str) -> None:
     asyncio.create_task(tts_client.speak(phrase))
 
 
-def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> None:
-    producto = args.get("producto") or "el producto"
-    cantidad = args.get("cantidad")
-    unidad = args.get("unidad") or ""
+def _narrate_event(event: str, data: dict, *, timeout: float = 5.0) -> None:
+    """Pide al gateway la frase natural del evento y la reproduce.
 
+    Si el gateway no responde o falla, usa un fallback local ultra-corto
+    para que el flujo nunca quede en silencio absoluto.
+    """
+    async def _do():
+        try:
+            res = await api_client.narrate(event, data, timeout=timeout)
+            _narrate(res.get("text", ""))
+        except Exception as e:
+            logger.debug("narrate fallo, fallback local: %s", e)
+            _narrate(_narrate_fallback(event, data))
+    asyncio.create_task(_do())
+
+
+def _narrate_fallback(event: str, data: dict) -> str:
+    """Fallback ultra-corto si el gateway no responde. Suena robotico pero
+    nunca se pierde el aviso al usuario."""
+    producto = (data.get("producto") or "el producto").lower()
+    if event == "aceptada":
+        return f"Listo. {producto} actualizado."
+    if event == "sospechosa":
+        return f"Atencion. Movimiento sospechoso de {producto}."
+    if event == "confirmada":
+        return "Confirmado."
+    if event == "rechazada":
+        return "Rechazado."
+    if event == "consulta":
+        return f"{producto}: {data.get('stock_actual', '?')} {data.get('unidad', '')}."
+    if event == "sospechosos":
+        return f"{data.get('total', 0)} movimientos sospechosos."
+    if event == "registrar_manual":
+        return f"Anotado: {producto}."
+    if event == "invalid":
+        return f"No se pudo procesar: {data.get('args', {}).get('producto', '')}."
+    return f"Evento: {event}."
+
+
+def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> None:
     if isinstance(inv, dict) and "stock_actual" in inv:
         stock = inv["stock_actual"]
         bodega = inv.get("bodega") or "la bodega"
@@ -178,87 +228,92 @@ def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> No
         stock = inv[0].get("stock_actual", "?")
         bodega = inv[0].get("bodega", "la bodega")
     else:
-        stock = "?"
+        stock = None
         bodega = "la bodega"
-
-    if tool_name == "agregar_inventario":
-        _narrate(f"Se agregaron {cantidad} {unidad} de {producto}. Stock actual: {stock} {unidad}, en {bodega}.")
-    elif tool_name == "remover_inventario":
-        _narrate(f"Se removieron {cantidad} {unidad} de {producto}. Stock actual: {stock} {unidad}, en {bodega}.")
+    _narrate_event("aceptada", {
+        "tool_name": tool_name,
+        "producto": args.get("producto"),
+        "cantidad": args.get("cantidad"),
+        "unidad": args.get("unidad") or "",
+        "stock_actual": stock,
+        "bodega": bodega,
+        "tipo": "entrada" if tool_name == "agregar_inventario" else "salida",
+    })
 
 
 def _narrate_sospechosa(args: dict, puntaje: float, residual: float) -> None:
-    producto = args.get("producto") or "el producto"
-    cantidad = args.get("cantidad")
-    unidad = args.get("unidad") or ""
-    tipo = "ingreso" if args.get("tool_name") == "agregar_inventario" else "salida"
-    _narrate(
-        f"Atención. Se detectó un movimiento sospechoso: {tipo} de {cantidad} {unidad} de {producto}. "
-        f"Riesgo de {puntaje:.1f} sigmas. Por favor confirma con sí o no."
-    )
+    _narrate_event("sospechosa", {
+        "tool_name": args.get("tool_name"),
+        "producto": args.get("producto"),
+        "cantidad": args.get("cantidad"),
+        "unidad": args.get("unidad") or "",
+        "puntaje_riesgo": puntaje,
+        "tipo": "entrada" if args.get("tool_name") == "agregar_inventario" else "salida",
+    })
 
 
 def _narrate_confirmada() -> None:
-    _narrate("Movimiento confirmado. El stock fue actualizado.")
+    _narrate_event("confirmada", {})
 
 
 def _narrate_rechazada() -> None:
-    _narrate("Movimiento rechazado. El stock no fue modificado.")
+    _narrate_event("rechazada", {})
 
 
 def _narrate_consulta(inv) -> None:
     if isinstance(inv, dict) and "stock_actual" in inv:
-        _narrate(
-            f"Hay {inv['stock_actual']} {inv.get('unidad', '')} de {inv.get('nombre', 'ese producto')} "
-            f"en {inv.get('bodega', 'la bodega')}."
-        )
+        _narrate_event("consulta", {
+            "producto": inv.get("nombre"),
+            "stock_actual": inv.get("stock_actual"),
+            "unidad": inv.get("unidad", ""),
+            "bodega": inv.get("bodega", "la bodega"),
+        })
     elif isinstance(inv, list) and inv:
         if len(inv) == 1:
             r = inv[0]
-            _narrate(f"Hay {r['stock_actual']} {r.get('unidad', '')} de {r['nombre']} en {r.get('bodega', 'la bodega')}.")
+            _narrate_event("consulta", {
+                "producto": r.get("nombre"),
+                "stock_actual": r.get("stock_actual"),
+                "unidad": r.get("unidad", ""),
+                "bodega": r.get("bodega", "la bodega"),
+            })
         else:
             total = sum(float(r.get("stock_actual") or 0) for r in inv)
-            partes = ", ".join(f"{r.get('stock_actual')} en {r.get('bodega')}" for r in inv[:3])
-            _narrate(f"Hay un total de {total} unidades. Encontre stock en: {partes}.")
+            _narrate_event("consulta", {
+                "producto": "varios",
+                "stock_actual": total,
+                "unidad": "unidades",
+                "bodega": f"{len(inv)} bodegas",
+            })
 
 
 def _narrate_sospechosos(rows: list[dict]) -> None:
     if not rows:
-        _narrate("No hay movimientos sospechosos en la auditoria.")
+        _narrate_event("sospechosos", {"total": 0})
         return
     top = max(rows, key=lambda r: r["puntaje_riesgo"])
-    _narrate(
-        f"Encontre {len(rows)} movimientos sospechosos. "
-        f"El mas grave: {top['producto_nombre']}, {top['tipo']} de {top['cantidad_reportada']}, "
-        f"con un riesgo de {top['puntaje_riesgo']:.1f} sigmas."
-    )
+    _narrate_event("sospechosos", {
+        "total": len(rows),
+        "top_producto": top.get("producto_nombre"),
+        "top_cantidad": top.get("cantidad_reportada"),
+        "top_puntaje": top.get("puntaje_riesgo"),
+        "top_tipo": top.get("tipo"),
+        "top_unidad": "Unidad",  # no la tenemos en el row; default
+    })
 
 
 def _narrate_invalid(tool_name: str, args: dict) -> None:
     """Caso 'no se encolo' — el LLM devolvio la tool pero el producto/cantidad
     no son validos, asi que la CLI la descarto y debe avisar al usuario."""
-    prod = args.get("producto") or ""
-    cant = args.get("cantidad")
-    if tool_name == "confirmar_movimiento":
-        _narrate("No entendi la confirmacion. Responde si o no.")
-    elif not prod:
-        accion = "agregar" if tool_name == "agregar_inventario" else "remover"
-        _narrate(
-            f"No se que producto quieres {accion}. "
-            f"Dime algo como: {accion} cinco kilos de papa, o cuanto hay de tomate."
-        )
-    elif cant is None or float(cant) <= 0:
-        _narrate(f"La cantidad no es valida. Cuanto quieres {tool_name.replace('_', ' ')} de {prod}?")
-    else:
-        _narrate(f"No se pudo procesar la operacion sobre {prod}.")
+    _narrate_event("invalid", {
+        "tool_name": tool_name,
+        "args": args,
+    })
 
 
 def _narrate_no_action() -> None:
     """Caso 'tool_calls vacio' — el LLM no decidio nada util."""
-    _narrate(
-        "No entendi la instruccion. Prueba con agregar cinco kilos de papa, "
-        "cuanto hay de tomate, o hay algo sospechoso."
-    )
+    _narrate_event("no_action", {})
 
 
 def show_sospechosos(rows: list[dict]) -> None:
@@ -316,7 +371,33 @@ async def handle_query(state: SessionState, text: str) -> None:
     requested = resp.get("backend_requested")
     if backend and requested:
         if resp.get("fallback_used"):
-            console.print(f"  [yellow]i backend=[/yellow][cyan]{backend}[/cyan][yellow] (solicitado {requested}, fallback por error)[/yellow]")
+            reason = resp.get("fallback_reason", "")
+            #  Reason viene como "service_down:openrouter-service (no esta corriendo; arrancalo con ...)"
+            #  o "http_429:rate_limited — gemma-4-31b-it:free is temporarily rate-limited..."
+            if reason.startswith("service_down:"):
+                #  Extraer el comando docker compose del mensaje (si esta)
+                console.print(
+                    f"  [yellow]i cloud=[/yellow][magenta]{requested}[/magenta]"
+                    f"[yellow] fallo, use local=[cyan]{backend}[/cyan][/yellow]"
+                )
+                console.print(f"    [dim]motivo:[/dim] [yellow]{reason}[/yellow]")
+            elif "rate_limited" in reason or "http_429" in reason:
+                console.print(
+                    f"  [yellow]i cloud=[/yellow][magenta]{requested}[/magenta]"
+                    f"[yellow] rate-limited, fallback a local=[cyan]{backend}[/cyan][/yellow]"
+                )
+                console.print(f"    [dim]detalle:[/dim] [yellow]{reason}[/yellow]")
+            elif reason:
+                console.print(
+                    f"  [yellow]i cloud=[/yellow][magenta]{requested}[/magenta]"
+                    f"[yellow] fallo, fallback a local=[cyan]{backend}[/cyan][/yellow]"
+                )
+                console.print(f"    [dim]motivo:[/dim] [yellow]{reason}[/yellow]")
+            else:
+                console.print(
+                    f"  [yellow]i cloud=[/yellow][magenta]{requested}[/magenta]"
+                    f"[yellow] fallo, fallback a local=[cyan]{backend}[/cyan][/yellow]"
+                )
         elif backend != requested:
             console.print(f"  [dim]backend=[/dim][cyan]{backend}[/cyan][dim] (override activo)[/dim]")
 
@@ -612,8 +693,8 @@ async def handle_cloud(state: SessionState, args: str) -> None:
         k, v = token.split("=", 1)
         k = k.strip().lower()
         v = v.strip().lower()
-        if k not in ("llm", "stt", "tts"):
-            console.print(f"[yellow]backend '{k}' no soportado (usa llm/stt/tts)[/yellow]")
+        if k not in ("llm", "stt", "tts", "narrator"):
+            console.print(f"[yellow]backend '{k}' no soportado (usa llm/stt/tts/narrator)[/yellow]")
             continue
         overrides[k] = v
     if not overrides:
@@ -632,13 +713,21 @@ async def handle_cloud(state: SessionState, args: str) -> None:
 def _print_config(cfg: dict) -> None:
     cloud = cfg.get("cloud_enabled", False)
     color = "magenta" if cloud else "green"
+    narrator = cfg.get("narrator", "default")
+    narrator_model = cfg.get("narrator_model", "")
+    n_color = "magenta" if narrator == "llm" else "green"
     console.print(
         f"[{color}]cloud_enabled = {cloud}[/{color}]\n"
-        f"  LLM = [cyan]{cfg.get('llm')}[/cyan]  (override: {cfg.get('llm_override') or 'auto'})\n"
-        f"  STT = [cyan]{cfg.get('stt')}[/cyan]  (override: {cfg.get('stt_override') or 'auto'})\n"
-        f"  TTS = [cyan]{cfg.get('tts')}[/cyan]  (override: {cfg.get('tts_override') or 'auto'})\n"
+        f"  LLM       = [cyan]{cfg.get('llm')}[/cyan]  (override: {cfg.get('llm_override') or 'auto'})\n"
+        f"  STT       = [cyan]{cfg.get('stt')}[/cyan]  (override: {cfg.get('stt_override') or 'auto'})\n"
+        f"  TTS       = [cyan]{cfg.get('tts')}[/cyan]  (override: {cfg.get('tts_override') or 'auto'})\n"
+        f"  Narrator  = [{n_color}]{narrator}[/{n_color}]  model=[cyan]{narrator_model}[/cyan]\n"
+        f"             (override: narrator={cfg.get('narrator_override') or 'auto'}, "
+        f"model={cfg.get('narrator_model_override') or 'auto'})\n"
         f"  [dim]defaults (env): llm={cfg.get('defaults', {}).get('llm')}, "
-        f"stt={cfg.get('defaults', {}).get('stt')}, tts={cfg.get('defaults', {}).get('tts')}[/dim]"
+        f"stt={cfg.get('defaults', {}).get('stt')}, tts={cfg.get('defaults', {}).get('tts')}, "
+        f"narrator={cfg.get('defaults', {}).get('narrator')}, "
+        f"model={cfg.get('defaults', {}).get('narrator_model')}[/dim]"
     )
 
 
@@ -675,6 +764,140 @@ async def handle_voices(state: SessionState, args: str) -> None:
         )
     console.print(table)
     console.print(f"  [dim]Para usar otra voz en TTS: tts <texto>  (por ahora se usa la default; selector en PWA)[/dim]")
+
+
+async def handle_models(state: SessionState, args: str) -> None:
+    """`models` -> lista modelos disponibles. `models all` -> incluye todos de OpenRouter.
+    `models select <slug>` -> cambia el modelo del narrador.
+    `models select auto` -> vuelve al default.
+    """
+    args = args.strip()
+    if args.startswith("select"):
+        #  models select <slug>  o  models select auto
+        rest = args[len("select"):].strip()
+        if not rest or rest.lower() == "auto":
+            try:
+                cfg = await api_client.select_model("narrator", None)
+            except Exception as e:
+                console.print(f"[red]select fallo: {e}[/red]")
+                return
+            console.print(f"[green]narrator_model = auto (vuelve al default: {cfg.get('defaults', {}).get('narrator_model', '?')})[/green]")
+            return
+        slug = rest
+        try:
+            cfg = await api_client.select_model("narrator", slug)
+        except Exception as e:
+            console.print(f"[red]select fallo: {e}[/red]")
+            return
+        console.print(f"[green]narrator_model = {cfg.get('narrator_model')}[/green]")
+        return
+    show_all = args.lower() == "all"
+    try:
+        data = await api_client.list_models(all=show_all, category=None)
+    except Exception as e:
+        console.print(f"[red]No se pudo listar modelos: {e}[/red]")
+        return
+    models = data.get("models", [])
+    current = data.get("current", {})
+    if not models:
+        console.print("[yellow]No hay modelos disponibles.[/yellow]")
+        return
+    table = Table(
+        title=f"Modelos disponibles ({len(models)})" + (" — OpenRouter completo" if show_all else " — curados"),
+        box=box.SIMPLE_HEAVY, border_style="cyan",
+    )
+    table.add_column("Slug", style="bold", no_wrap=True)
+    table.add_column("Nombre")
+    table.add_column("Costo/M in", justify="right")
+    table.add_column("Costo/M out", justify="right")
+    table.add_column("Free", justify="center")
+    for m in models:
+        slug = m.get("slug", "?")
+        is_active = slug == current.get("narrator_model")
+        name = m.get("name", "?")
+        if is_active:
+            name = f"{name}  [green]<-- narrador activo[/green]"
+        cost_in = m.get("cost_in", 0)
+        cost_out = m.get("cost_out", 0)
+        is_free = m.get("free", False)
+        free_marker = "[green]FREE[/green]" if is_free else f"${cost_in:.3f}"
+        table.add_row(
+            slug,
+            name,
+            f"${cost_in:.4f}" if not is_free else "$0",
+            f"${cost_out:.4f}" if not is_free else "$0",
+            free_marker,
+        )
+    console.print(table)
+    console.print(
+        f"\n  [dim]Actual: narrator=[cyan]{current.get('narrator_backend')}[/cyan] "
+        f"model=[cyan]{current.get('narrator_model')}[/cyan][/dim]"
+    )
+    console.print(
+        "\n  [yellow]uso:[/yellow]\n"
+        "    [cyan]models[/cyan]                  lista curada\n"
+        "    [cyan]models all[/cyan]              lista completa de OpenRouter (requiere OPENROUTER_API_KEY)\n"
+        "    [cyan]models select <slug>[/cyan]     cambia el modelo del narrador\n"
+        "    [cyan]models select auto[/cyan]      vuelve al default\n"
+    )
+
+
+async def handle_narrate_demo(state: SessionState, args: str) -> None:
+    """`narrate <event> [k=v ...]` -> pide al gateway que reformule el evento.
+    Util para probar el narrador y ver si el LLM lo deja mas natural.
+    Ejemplos:
+      narrate aceptada producto=papa cantidad=5 unidad=kg stock_actual=130
+      narrate sospechosa producto=harina cantidad=50 unidad=kg puntaje_riesgo=4.2
+    """
+    args = args.strip()
+    if not args:
+        console.print(
+            "[yellow]uso:[/yellow]\n"
+            "  [cyan]narrate aceptada producto=papa cantidad=5 unidad=kg stock_actual=130[/cyan]\n"
+            "  [cyan]narrate sospechosa producto=harina cantidad=50 puntaje_riesgo=4.2[/cyan]\n"
+            "  [cyan]narrate confirmada[/cyan]\n"
+            "  [cyan]narrate rechazada[/cyan]\n"
+            "  [cyan]narrate consulta producto=papa stock_actual=50 unidad=kg[/cyan]"
+        )
+        return
+    parts = args.split(maxsplit=1)
+    event = parts[0]
+    data: dict = {}
+    if len(parts) > 1:
+        for token in parts[1].split():
+            if "=" not in token:
+                console.print(f"[yellow]ignoro '{token}' (esperaba k=v)[/yellow]")
+                continue
+            k, v = token.split("=", 1)
+            #  Intentar convertir a numero
+            try:
+                v_typed: Any = float(v) if "." in v else int(v)
+            except ValueError:
+                v_typed = v
+            data[k] = v_typed
+    #  Si es narrador LLM, dar margen (puede tardar)
+    try:
+        cfg = await api_client.get_config()
+        timeout = 15.0 if cfg.get("narrator") == "llm" else 5.0
+    except Exception:
+        timeout = 10.0
+    try:
+        res = await api_client.narrate(event, data, timeout=timeout)
+    except Exception as e:
+        console.print(f"[red]narrate fallo: {e}[/red]")
+        return
+    text = res.get("text", "")
+    backend = res.get("backend", "?")
+    model = res.get("model", "?")
+    console.print(
+        f"  [dim]event:[/dim]  [cyan]{event}[/cyan]\n"
+        f"  [dim]backend:[/dim] [magenta]{backend}[/magenta]  "
+        f"[dim]model:[/dim] [magenta]{model}[/magenta]\n"
+        f"  [dim]texto:[/dim]\n"
+    )
+    console.print(Panel(Text(text, style="bold"), border_style="green", box=box.ROUNDED))
+    #  Reproducir
+    await tts_client.speak(text)
 
 
 # =====================================================================
@@ -781,6 +1004,14 @@ async def main_async(args: argparse.Namespace) -> int:
             continue
         if low == "voices":
             await handle_voices(state, "")
+            console.print()
+            continue
+        if low == "models" or low.startswith("models "):
+            await handle_models(state, user_input[len("models "):].strip() if low.startswith("models ") else "")
+            console.print()
+            continue
+        if low == "narrate" or low.startswith("narrate "):
+            await handle_narrate_demo(state, user_input[len("narrate "):].strip() if low.startswith("narrate ") else "")
             console.print()
             continue
         if low.startswith("tts "):

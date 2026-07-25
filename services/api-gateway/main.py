@@ -9,6 +9,10 @@ Responsabilidades:
   la CLI/PWA nunca habla directo con voice-service ni kokoro-service ni
   elevenlabs-service — siempre pasa por aca.
 - Exponer /api/config para que la UI consulte y modifique el toggle runtime.
+- Exponer /api/narrate para que la CLI/PWA obtenga frases naturales
+  (templates por default, LLM reescritor con Gemma 4 31B free si esta
+  activado).
+- Exponer /api/models para listar y seleccionar modelos en runtime.
 """
 from __future__ import annotations
 
@@ -22,7 +26,8 @@ from typing import Any
 
 import httpx
 import websockets
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, Depends, Header
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
@@ -41,9 +46,156 @@ from llm_common.db import (
     get_pending_status,
 )
 from llm_common import nlu
+from llm_common.narrator import Narrator, NarrateEvent, NarratorConfig
+
+import re as _re
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("api-gateway")
+
+# =====================================================================
+#  B-Link: el asistente conversacional (OpenRouter free model)
+# =====================================================================
+#  Cuando la query NO parece ser de inventario, el gateway la manda al
+#  free model de OpenRouter (default: Gemma 4 31B free) que sabe que es
+#  "B-Link, el asistente de inventario en un parpadeo". Asi el main LLM
+#  (DeepSeek V4 Flash, de pago) solo se gasta en tool calls reales.
+# =====================================================================
+
+CONVERSATION_MODEL = os.getenv("CONVERSATION_MODEL", "google/gemma-4-31b-it:free")
+
+# =====================================================================
+#  Configuracion HTTP para el frontend
+# =====================================================================
+#  ALLOWED_ORIGINS: lista separada por comas de origins que pueden
+#  llamar al gateway desde el browser (CORS). Default "*" para dev;
+#  en produccion conviene poner el dominio real del frontend.
+#  Ej: ALLOWED_ORIGINS=https://b-link.app,https://www.b-link.app
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+
+#  API_KEY: si esta seteada, todos los endpoints requieren el header
+#  X-API-Key: <valor>. Si esta vacia, no hay auth (util para dev local).
+#  En produccion SIEMPRE setearla.
+API_KEY = os.getenv("API_KEY", "").strip()
+
+B_LINK_PROMPT = """Sos B-Link, el asistente de inventario en un parpadeo. Hablas en espanol rioplatense, breve, calido y con onda.
+
+Tu rol:
+- Sos la cara conversacional del sistema de inventario. Saludas al usuario, charlas, respondes preguntas generales.
+- NO ejecutas acciones de inventario vos mismo: el sistema principal (con herramientas) se encarga de agregar, sacar, consultar stock, etc.
+- Si el usuario te pide algo de inventario, no inventes respuestas: derivá al sistema principal con un ejemplo ("decime 'agregar 5 kilos de papa' y yo me encargo").
+
+Reglas:
+- 1-2 oraciones maximo. Si la pregunta amerita mas, expandi un poco pero sin volar.
+- Sin emojis (o muy de vez en cuando).
+- Si te preguntan tu nombre, soy B-Link, asistente de inventario.
+- Si no sabes algo, decilo y sugerí como averiguarlo.
+- NUNCA inventes numeros de stock, productos o bodegas.
+"""
+
+#  Palabras clave para detectar queries de inventario (regex rapido, sin
+#  gastar un LLM call). Si matchea, va al main LLM con tool_choice=required.
+#  Si NO matchea, va al modelo conversacional (B-Link).
+_INVENTORY_KEYWORDS = _re.compile(
+    r"\b("
+    #  verbos de escritura
+    r"agreg[aeo]?r?|met[aeo]?|sac[aeo]?|quit[aeo]?|remov[aeo]?|rest[aeo]?|"
+    r"vend[aeo]?|compr[aeo]?|ingres[aeo]?|anot[aeo]?|carg[aeo]?|"
+    #  consultas / lecturas
+    r"cu[aá]nto[^\s]* hay|cu[aá]nto[^\s]* queda|cu[aá]nto[^\s]* ten[eé]s|"
+    r"hay (algo|stock|producto|movimiento)|"
+    r"stock|inventario|producto[^\s]*s?|"
+    #  alertas / kalman
+    r"sospechos[oa]s?|movimiento[^\s]*s? raro|alerta[^\s]*s?|confirm[aeo]?r?|rechaz[aeo]?|"
+    #  unidades
+    r"kilo[^\s]*s?|gramo[^\s]*s?|litro[^\s]*s?|unidad(?:es)?|caja[^\s]*s?|"
+    r"sobre[^\s]*s?|pieza[^\s]*s?|frasco[^\s]*s?|paquete[^\s]*s?|rollo[^\s]*s?"
+    r")\b",
+    _re.IGNORECASE,
+)
+
+
+def _is_inventory_query(text: str) -> bool:
+    """True si la query parece ser de inventario (debe ir al main LLM con tools)."""
+    return bool(_INVENTORY_KEYWORDS.search(text or ""))
+
+
+async def _call_conversation_model(query: str) -> tuple[str | None, str | None]:
+    """Llama al free model de OpenRouter para charlar. Devuelve (texto, error).
+
+    Si OpenRouter no esta disponible (sin key, error de red, rate limit, etc),
+    devuelve (None, mensaje_de_error) y el caller decide que hacer.
+    Reintenta 1 vez con backoff si recibe 429 (rate limit comun en free tier).
+    """
+    if not OPENROUTER_API_KEY:
+        return None, "OPENROUTER_API_KEY not configured"
+    import asyncio as _asyncio
+    last_err: str | None = None
+    for attempt in range(2):  # 1 retry
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                r = await client.post(
+                    f"{OPENROUTER_BASE}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": CONVERSATION_MODEL,
+                        "messages": [
+                            {"role": "system", "content": B_LINK_PROMPT},
+                            {"role": "user", "content": query},
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": 200,
+                    },
+                )
+            if r.status_code == 429:
+                last_err = f"http 429 (rate limited, intento {attempt + 1}/2)"
+                logger.warning("B-Link rate-limited, intento %d/2", attempt + 1)
+                if attempt < 1:
+                    await _asyncio.sleep(2.0)  # backoff
+                    continue
+                return None, last_err
+            if r.status_code != 200:
+                err = r.text[:200]
+                logger.warning("conversation model http %d: %s", r.status_code, err)
+                return None, f"http {r.status_code}"
+            data = r.json()
+            text = (data["choices"][0]["message"]["content"] or "").strip()
+            return text, None
+        except Exception as e:
+            logger.warning("conversation model error: %s", e)
+            return None, str(e)
+    return None, last_err
+
+
+#  Fallback hardcoded para cuando B-Link no puede responder (rate limit,
+#  sin internet, etc). Asi el usuario SIEMPRE recibe una respuesta de B-Link.
+_B_LINK_FALLBACK_RESPONSES = [
+    "Hola, soy B-Link, el asistente de inventario en un parpadeo. "
+    "Decime que necesitas (ej: 'agregar 5 kilos de papa') y me pongo a trabajar.",
+    "Buenas. Soy B-Link. Estoy aca para ayudarte con el inventario: "
+    "agregar, sacar, consultar stock, investigar movimientos. Que necesitás?",
+    "Acá ando. Soy B-Link. El sistema principal se encarga de las acciones de "
+    "inventario, yo soy la cara charlatana mientras el modulo conversacional "
+    "vuelve del rate limit. Que decis?",
+]
+
+
+def _b_link_hardcoded(query: str) -> str:
+    """Fallback cuando el free model no responde. Respuesta corta en el estilo B-Link."""
+    q = (query or "").lower().strip()
+    if any(w in q for w in ("hola", "buenas", "buen dia", "buen dia", "que tal", "hello", "hi")):
+        return _B_LINK_FALLBACK_RESPONSES[0]
+    if any(w in q for w in ("como te llamas", "quien sos", "que sos", "your name")):
+        return "Soy B-Link, el asistente de inventario en un parpadeo."
+    if any(w in q for w in ("gracias", "thanks", "muchas gracias")):
+        return "De nada. Cuando necesites, aca estoy."
+    #  Default: redirigir al sistema principal
+    return ("Estoy con el modulo conversacional caido (rate limit). "
+            "Pero el sistema principal de inventario funciona: "
+            "proba con 'agregar 5 kilos de papa' o 'cuanto hay de tomate'.")
 
 # =====================================================================
 #  Configuracion por env (defaults al arranque)
@@ -52,6 +204,10 @@ logger = logging.getLogger("api-gateway")
 LLM_BACKEND = os.getenv("LLM_BACKEND", "needle").lower()  # needle | openrouter
 STT_BACKEND = os.getenv("STT_BACKEND", "whisper").lower()  # whisper | elevenlabs
 TTS_BACKEND = os.getenv("TTS_BACKEND", "kokoro").lower()   # kokoro  | elevenlabs
+NARRATOR_BACKEND = os.getenv("NARRATOR_BACKEND", "default").lower()  # default | llm
+NARRATOR_MODEL = os.getenv("NARRATOR_MODEL", "google/gemma-4-31b-it:free")
+OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 
 NEEDLE_URL = os.getenv("NEEDLE_URL", "http://needle-service:8081")
 OPENROUTER_URL = os.getenv("OPENROUTER_URL", "http://openrouter-service:8082")
@@ -70,8 +226,18 @@ _cloud_toggle: bool = os.getenv("CLOUD_ENABLED", "false").lower() == "true"
 _llm_override: str | None = None   # None = seguir el toggle
 _stt_override: str | None = None
 _tts_override: str | None = None
+_narrator_override: str | None = None   # None = seguir el toggle
+_narrator_model_override: str | None = None
 
 _lock = asyncio.Lock()
+
+#  Singleton del narrador (se reusa entre requests para aprovechar la cache)
+_narrator: Narrator = Narrator(NarratorConfig(
+    backend=NARRATOR_BACKEND,
+    model=NARRATOR_MODEL,
+    base_url=OPENROUTER_BASE,
+    api_key=OPENROUTER_API_KEY,
+))
 
 
 def _pick_llm() -> str:
@@ -92,6 +258,24 @@ def _pick_tts() -> str:
     return "elevenlabs" if _cloud_toggle else TTS_BACKEND
 
 
+def _pick_narrator() -> str:
+    if _narrator_override in ("default", "llm"):
+        return _narrator_override
+    return "llm" if _cloud_toggle else NARRATOR_BACKEND
+
+
+def _active_narrator_model() -> str:
+    return _narrator_model_override or NARRATOR_MODEL
+
+
+def _refresh_narrator() -> None:
+    """Reconfigura el singleton del narrador con el estado actual."""
+    _narrator.config.backend = _pick_narrator()
+    _narrator.config.model = _active_narrator_model()
+    _narrator.config.api_key = OPENROUTER_API_KEY
+    _narrator.config.base_url = OPENROUTER_BASE
+
+
 def _llm_url() -> str:
     return OPENROUTER_URL if _pick_llm() == "openrouter" else NEEDLE_URL
 
@@ -102,10 +286,19 @@ def _current_config() -> dict[str, Any]:
         "llm": _pick_llm(),
         "stt": _pick_stt(),
         "tts": _pick_tts(),
+        "narrator": _pick_narrator(),
+        "narrator_model": _active_narrator_model(),
+        "conversation_model": CONVERSATION_MODEL,
         "llm_override": _llm_override,
         "stt_override": _stt_override,
         "tts_override": _tts_override,
-        "defaults": {"llm": LLM_BACKEND, "stt": STT_BACKEND, "tts": TTS_BACKEND},
+        "narrator_override": _narrator_override,
+        "narrator_model_override": _narrator_model_override,
+        "defaults": {
+            "llm": LLM_BACKEND, "stt": STT_BACKEND, "tts": TTS_BACKEND,
+            "narrator": NARRATOR_BACKEND, "narrator_model": NARRATOR_MODEL,
+            "conversation_model": CONVERSATION_MODEL,
+        },
     }
 
 
@@ -122,25 +315,71 @@ async def _post_with_fallback(
     want_cloud: bool,
     label: str,
     timeout: float = 60.0,
-) -> tuple[httpx.Response, str, bool]:
+) -> tuple[httpx.Response, str, bool, str | None]:
     """POST con fallback cloud->local.
 
-    Retorna (response, backend_usado, fallback_used).
+    Retorna (response, backend_usado, fallback_used, fallback_reason).
     Si want_cloud=True y cloud_url dado, intenta cloud primero; si falla,
     cae a local con fallback_used=True. Si want_cloud=False va directo a local.
+
+    fallback_reason es un string corto explicando por que cayo a local
+    (ej: "service_down:openrouter-service", "http_429:rate_limited",
+    "dns_error", "timeout"). None si no hubo fallback o no se sabe.
     """
     if want_cloud and cloud_url:
         try:
             r = await client.post(cloud_url, json=payload, timeout=timeout)
             if r.status_code == 200:
-                return r, "cloud", False
-            logger.warning("%s cloud http %d, falling back", label, r.status_code)
-        except (httpx.RequestError, httpx.TimeoutException) as e:
+                return r, "cloud", False, None
+            #  HTTP no-200: log + fallback con motivo
+            reason = _classify_http_error(r.status_code, cloud_url, r)
+            logger.warning("%s cloud http %d, falling back (%s)", label, r.status_code, reason)
+        except httpx.ConnectError as e:
+            #  DNS error o "connection refused" -> el servicio cloud no esta corriendo
+            host = cloud_url.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+            reason = f"service_down:{host} (no esta corriendo; arrancalo con docker compose --profile with-{_profile_for_host(host)} up -d)"
+            logger.warning("%s cloud service down: %s, falling back", label, e)
+        except httpx.TimeoutException as e:
+            reason = "timeout"
+            logger.warning("%s cloud timeout, falling back: %s", label, e)
+        except httpx.RequestError as e:
+            reason = f"transport_error:{type(e).__name__}"
             logger.warning("%s cloud transport error: %s, falling back", label, e)
         r = await client.post(local_url, json=payload, timeout=timeout)
-        return r, "local", True
+        return r, "local", True, reason
     r = await client.post(local_url, json=payload, timeout=timeout)
-    return r, "local", False
+    return r, "local", False, None
+
+
+def _profile_for_host(host: str) -> str:
+    """Mapea hostname de un servicio cloud al nombre de perfil de docker compose."""
+    return {
+        "openrouter-service": "openrouter",
+        "elevenlabs-service": "elevenlabs",
+    }.get(host, "voice")
+
+
+def _classify_http_error(status: int, url: str, response: httpx.Response) -> str:
+    """Clasifica un HTTP error en un reason corto para mostrar al usuario."""
+    host = url.split("//", 1)[-1].split("/", 1)[0].split(":")[0]
+    if status == 401 or status == 403:
+        return f"http_{status}:api_key_invalida_o_sin_permiso ({host})"
+    if status == 404:
+        return f"http_404:endpoint_no_encontrado_en_{host}"
+    if status == 429:
+        #  Rate limit - intentar extraer el mensaje de OpenRouter si esta
+        msg = ""
+        try:
+            err = response.json()
+            raw = err.get("error", {}).get("metadata", {}).get("raw", "")
+            if raw:
+                msg = f" — {raw[:120]}"
+        except Exception:
+            pass
+        return f"http_429:rate_limited{msg}"
+    if status == 502 or status == 503 or status == 504:
+        return f"http_{status}:upstream_no_disponible ({host})"
+    return f"http_{status}"
 
 
 # =====================================================================
@@ -175,6 +414,7 @@ class QueryResponse(BaseModel):
     backend: str
     backend_requested: str
     fallback_used: bool
+    fallback_reason: str | None = None
     tool_calls: list[dict] = []
     pending: list[dict] = []
     raw_output: str = ""
@@ -185,11 +425,21 @@ class ConfigUpdate(BaseModel):
     llm: str | None = None      # "needle" | "openrouter" | "auto"
     stt: str | None = None      # "whisper" | "elevenlabs" | "auto"
     tts: str | None = None      # "kokoro" | "elevenlabs" | "auto"
+    narrator: str | None = None  # "default" | "llm" | "auto"
+    narrator_model: str | None = None  # slug de OpenRouter, o "auto" para volver al default
 
 
 # =====================================================================
 #  /api/config  (toggle runtime)
 # =====================================================================
+
+_VALID_OVERRIDES = {
+    "llm": ("needle", "openrouter"),
+    "stt": ("whisper", "elevenlabs"),
+    "tts": ("kokoro", "elevenlabs"),
+    "narrator": ("default", "llm"),
+}
+
 
 @app.get("/api/config")
 async def get_config():
@@ -199,32 +449,37 @@ async def get_config():
 @app.post("/api/config")
 async def update_config(req: ConfigUpdate):
     global _cloud_toggle, _llm_override, _stt_override, _tts_override
+    global _narrator_override, _narrator_model_override
     async with _lock:
         if req.cloud_enabled is not None:
             _cloud_toggle = bool(req.cloud_enabled)
-        for field, name in (("llm", "_llm_override"), ("stt", "_stt_override"), ("tts", "_tts_override")):
+        for field in ("llm", "stt", "tts", "narrator"):
             v = getattr(req, field)
             if v is None:
                 continue
             v = v.lower()
+            attr = f"_{field}_override"
             if v == "auto":
-                globals()[name] = None
+                globals()[attr] = None
             elif v in _VALID_OVERRIDES[field]:
-                globals()[name] = v
+                globals()[attr] = v
             else:
                 raise HTTPException(400, f"{field} invalido: {v}")
+        #  narrator_model es libre: cualquier slug de OpenRouter vale.
+        #  Si viene vacio o "auto", vuelve al default.
+        if req.narrator_model is not None:
+            v = req.narrator_model.strip()
+            if not v or v.lower() == "auto":
+                _narrator_model_override = None
+            else:
+                _narrator_model_override = v
+        _refresh_narrator()
         logger.info(
-            "config update: cloud=%s llm=%s stt=%s tts=%s",
+            "config update: cloud=%s llm=%s stt=%s tts=%s narrator=%s model=%s",
             _cloud_toggle, _pick_llm(), _pick_stt(), _pick_tts(),
+            _pick_narrator(), _active_narrator_model(),
         )
     return _current_config()
-
-
-_VALID_OVERRIDES = {
-    "llm": ("needle", "openrouter"),
-    "stt": ("whisper", "elevenlabs"),
-    "tts": ("kokoro", "elevenlabs"),
-}
 
 
 # =====================================================================
@@ -268,9 +523,40 @@ async def health():
 
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
+    text = (req.text or "").strip()
+
+    #  1) Si la query NO parece de inventario, va al modelo conversacional
+    #     (B-Link via OpenRouter free). Asi el main LLM (pago) no se gasta
+    #     en saludos y preguntas generales.
+    if not _is_inventory_query(text):
+        bl_text, bl_err = await _call_conversation_model(text)
+        if bl_text is not None:
+            return QueryResponse(
+                backend="b-link",
+                backend_requested="b-link",
+                fallback_used=False,
+                tool_calls=[],
+                pending=[],
+                raw_output=bl_text,
+            )
+        #  B-Link fallo (rate limit, sin internet, etc). Usamos la respuesta
+        #  hardcoded como fallback final, asi el usuario SIEMPRE recibe una
+        #  respuesta coherente de B-Link y no algo raro del LLM principal.
+        logger.info("b-link no disponible (%s), usando fallback hardcoded", bl_err)
+        return QueryResponse(
+            backend="b-link-fallback",
+            backend_requested="b-link",
+            fallback_used=True,
+            fallback_reason=bl_err,
+            tool_calls=[],
+            pending=[],
+            raw_output=_b_link_hardcoded(text),
+        )
+
+        #  (El codigo de abajo solo corre si la query PARECE inventario.)
     pick = _pick_llm()
     payload: dict[str, Any] = {
-        "query": req.text,
+        "query": text,
         "tools": "[]",
         "session_id": req.session_id or "default",
         "mode": "full",
@@ -282,7 +568,7 @@ async def query(req: QueryRequest):
 
     async with httpx.AsyncClient(timeout=60) as client:
         if pick == "openrouter":
-            r, used, fallback = await _post_with_fallback(
+            r, used, fallback, reason = await _post_with_fallback(
                 client,
                 cloud_url=f"{OPENROUTER_URL}/infer",
                 local_url=f"{NEEDLE_URL}/infer",
@@ -291,7 +577,7 @@ async def query(req: QueryRequest):
                 label="LLM",
             )
         else:
-            r, used, fallback = await _post_with_fallback(
+            r, used, fallback, reason = await _post_with_fallback(
                 client,
                 cloud_url=None,
                 local_url=f"{NEEDLE_URL}/infer",
@@ -308,6 +594,7 @@ async def query(req: QueryRequest):
         backend=used,
         backend_requested=pick,
         fallback_used=fallback,
+        fallback_reason=reason,
         tool_calls=data.get("tool_calls", []),
         pending=data.get("pending", []),
         raw_output=data.get("raw_output", ""),
@@ -537,6 +824,161 @@ async def audio_voices():
             return out
     except httpx.RequestError as e:
         raise HTTPException(503, f"elevenlabs unreachable: {e}")
+
+
+# =====================================================================
+#  /api/narrate  (texto natural para TTS)
+# =====================================================================
+
+class NarrateRequest(BaseModel):
+    event: str                                    # NarrateEvent value
+    data: dict = {}                               # campos del evento
+
+
+@app.post("/api/narrate")
+async def narrate(req: NarrateRequest):
+    """Convierte un evento estructurado en una frase natural en espanol.
+
+    Si el backend activo es "llm" y hay API key configurada, reescribe con
+    el modelo OpenRouter seleccionado (default: gemma-4-31b-it:free).
+    Si falla, cae al template hardcodeado (variaciones, no repetitivo).
+    """
+    try:
+        event = NarrateEvent(req.event)
+    except ValueError:
+        valid = ", ".join(e.value for e in NarrateEvent)
+        raise HTTPException(400, f"event invalido: {req.event!r}. validos: {valid}")
+
+    _refresh_narrator()
+    text = await _narrator.narrate(event, req.data)
+    return {
+        "text": text,
+        "event": event.value,
+        "backend": _pick_narrator(),
+        "model": _active_narrator_model(),
+    }
+
+
+# =====================================================================
+#  /api/models  (selector de modelos en runtime)
+# =====================================================================
+
+#  Modelos recomendados (curados). OpenRouter tiene muchos mas; mostramos
+#  estos para no abrumar al usuario. Para ver todos: GET /api/models?all=true
+_RECOMMENDED_MODELS = [
+    {
+        "slug": "deepseek/deepseek-v4-flash",
+        "name": "DeepSeek V4 Flash",
+        "category": "llm",
+        "cost_in": 0.094, "cost_out": 0.188,
+        "smart": True, "free": False, "tagline": "Smart, tool calling solido, ~$0.09/M in",
+    },
+    {
+        "slug": "deepseek/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro",
+        "category": "llm",
+        "cost_in": 0.435, "cost_out": 0.870,
+        "smart": True, "free": False, "tagline": "V4 full, mas caro pero mas capaz",
+    },
+    {
+        "slug": "google/gemma-4-31b-it:free",
+        "name": "Gemma 4 31B (free)",
+        "category": "llm",
+        "cost_in": 0, "cost_out": 0,
+        "smart": True, "free": True, "tagline": "Free tier de Google, ideal para narrador",
+    },
+    {
+        "slug": "google/gemma-4-26b-a4b-it:free",
+        "name": "Gemma 4 26B (free)",
+        "category": "llm",
+        "cost_in": 0, "cost_out": 0,
+        "smart": True, "free": True, "tagline": "Free tier mas chico, mas rapido",
+    },
+    {
+        "slug": "anthropic/claude-3.5-haiku",
+        "name": "Claude 3.5 Haiku",
+        "category": "llm",
+        "cost_in": 0.80, "cost_out": 4.0,
+        "smart": True, "free": False, "tagline": "Si preferis Anthropic",
+    },
+]
+
+
+@app.get("/api/models")
+async def list_models(all: bool = False, category: str | None = None):
+    """Lista los modelos disponibles por categoria.
+
+    Por default devuelve solo los recomendados (curados). Con ?all=true
+    intenta listar TODOS los modelos de OpenRouter (hace falta API key).
+
+    Categorias: llm, narrator (el narrador usa el mismo pool que llm).
+    """
+    if category and category not in ("llm", "narrator"):
+        raise HTTPException(400, f"category invalida: {category}")
+
+    items = list(_RECOMMENDED_MODELS)
+    if all and OPENROUTER_API_KEY:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.get(
+                    f"{OPENROUTER_BASE}/models",
+                    headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"},
+                )
+                if r.status_code == 200:
+                    raw = r.json().get("data", [])
+                    for m in raw:
+                        pricing = m.get("pricing", {})
+                        items.append({
+                            "slug": m.get("id"),
+                            "name": m.get("name"),
+                            "category": "llm",
+                            "cost_in": float(pricing.get("prompt", "0") or 0) * 1_000_000,
+                            "cost_out": float(pricing.get("completion", "0") or 0) * 1_000_000,
+                            "smart": True,
+                            "free": float(pricing.get("prompt", "0") or 0) == 0,
+                            "tagline": m.get("description", "")[:80],
+                        })
+        except Exception as e:
+            logger.warning("error listando modelos de OpenRouter: %s", e)
+
+    if category:
+        items = [m for m in items if m["category"] == category]
+
+    return {
+        "models": items,
+        "current": {
+            "narrator_backend": _pick_narrator(),
+            "narrator_model": _active_narrator_model(),
+            "llm": _pick_llm(),
+        },
+        "defaults": {
+            "narrator": NARRATOR_BACKEND,
+            "narrator_model": NARRATOR_MODEL,
+        },
+    }
+
+
+class ModelSelect(BaseModel):
+    category: str               # "narrator" (extensible a "llm" en el futuro)
+    model: str | None = None    # slug OpenRouter, o null/auto para reset
+
+
+@app.post("/api/models/select")
+async def select_model(req: ModelSelect):
+    """Cambia el modelo activo de una categoria en runtime.
+
+    Equivale a POST /api/config con el campo especifico, pero con un
+    endpoint dedicado que es mas descubrible y self-documenting.
+    """
+    global _narrator_model_override
+    if req.category == "narrator":
+        if req.model and req.model.lower() != "auto":
+            _narrator_model_override = req.model.strip()
+        else:
+            _narrator_model_override = None
+        _refresh_narrator()
+        return _current_config()
+    raise HTTPException(400, f"category no soportada: {req.category!r}. usar 'narrator'")
 
 
 # =====================================================================
@@ -847,7 +1289,7 @@ async def registrar_voz(req: RegistroVozRequest):
     #  Fallback: LLM (con cloud->local)
     async with httpx.AsyncClient(timeout=60) as client:
         if _pick_llm() == "openrouter":
-            r, used, fallback = await _post_with_fallback(
+            r, used, fallback, reason = await _post_with_fallback(
                 client,
                 cloud_url=f"{OPENROUTER_URL}/infer",
                 local_url=f"{NEEDLE_URL}/infer",
@@ -862,7 +1304,7 @@ async def registrar_voz(req: RegistroVozRequest):
                 label="LLM(voz)",
             )
         else:
-            r, used, fallback = await _post_with_fallback(
+            r, used, fallback, reason = await _post_with_fallback(
                 client,
                 cloud_url=None,
                 local_url=f"{NEEDLE_URL}/infer",
@@ -885,6 +1327,7 @@ async def registrar_voz(req: RegistroVozRequest):
         "via": "llm",
         "backend": used,
         "fallback_used": fallback,
+        "fallback_reason": reason,
         "tool_calls": data.get("tool_calls", []),
         "pending": data.get("pending", []),
         "raw_output": data.get("raw_output", ""),

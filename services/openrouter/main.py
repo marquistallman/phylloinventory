@@ -45,7 +45,26 @@ OPENROUTER_BASE = os.getenv("OPENROUTER_BASE", "https://openrouter.ai/api/v1")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-v4-flash")
 SYSTEM_PROMPT = os.getenv(
     "OPENROUTER_SYSTEM_PROMPT",
-    "Eres un asistente de inventario en español. Hablas de forma natural y breve.",
+    """Eres un asistente de inventario en español rioplatense. Hablas natural y breve.
+
+REGLAS OBLIGATORIAS (incumplir = error del sistema):
+
+1. SI el usuario pide una accion de inventario (agregar, meter, sacar, quitar,
+   consultar stock, cuanto hay, hay algo raro, sospechoso, confirmar, rechazar),
+   DEBES llamar a la tool correspondiente. NO respondas solo con texto plano.
+
+2. Tu salida SIEMPRE tiene que ser una o mas tool_calls para pedidos de
+   inventario. La frase "listo, agrego 5 kilos de papa" sin tool_call NO
+   cuenta como accion — el stock NO se modifica.
+
+3. NO inventes numeros: cantidad y unidad vienen de lo que dijo el usuario.
+   Si dijo "5 kilos" -> cantidad=5, unidad="kg" (o "Kilogram").
+
+4. Despues de las tool_calls, podes agregar un content breve confirmando
+   ("Listo", "Anotado", etc), pero las tools son lo importante.
+
+5. Para saludos o preguntas que NO son de inventario (ej: "hola",
+   "como te llamas"), responde brevemente sin tools.""",
 )
 
 
@@ -113,7 +132,13 @@ async def _call_openrouter(query: str) -> tuple[list[ToolCall], str]:
                     {"role": "user", "content": query},
                 ],
                 "tools": TOOLS_OPENAI,
-                "tool_choice": "auto",
+                #  "required" fuerza al LLM a llamar al menos una tool. La idea
+                #  es: si el usuario habla de inventario, LLAMA una tool (no
+                #  responda solo "listo, agrego 5 kilos" sin ejecutar nada).
+                #  Para "hola" el LLM va a tener que elegir la tool menos
+                #  mala (probablemente investigar_sospechosos) — eso lo
+                #  manejamos en el CLI como "no detecte ninguna accion util".
+                "tool_choice": "required",
                 "temperature": 0.1,
             },
         )

@@ -130,9 +130,14 @@ services:
       LLM_BACKEND: ${LLM_BACKEND:-needle}
       STT_BACKEND: ${STT_BACKEND:-whisper}
       TTS_BACKEND: ${TTS_BACKEND:-kokoro}
+      NARRATOR_BACKEND: ${NARRATOR_BACKEND:-default}
+      NARRATOR_MODEL: ${NARRATOR_MODEL:-google/gemma-4-31b-it:free}
+      CONVERSATION_MODEL: ${CONVERSATION_MODEL:-google/gemma-4-31b-it:free}
       CLOUD_ENABLED: ${CLOUD_ENABLED:-false}
       NEEDLE_URL: http://needle-service:8081
       OPENROUTER_URL: http://openrouter-service:8082
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE: ${OPENROUTER_BASE:-https://openrouter.ai/api/v1}
       VOICE_URL: http://voice-service:8100
       KOKORO_URL: http://kokoro-service:8205
       ELEVENLABS_URL: http://elevenlabs-service:8206

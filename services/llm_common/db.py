@@ -238,8 +238,16 @@ async def enqueue_pending(
             raise ValueError("cantidad debe ser > 0")
 
         cantidad = cantidad_normalizada
+        #  Normalizamos TANTO la cantidad como la unidad en el payload que
+        #  viaja al cliente. Asi el narrador / UI ve (0.25, "Kilogram") en
+        #  vez de (250, "Kilogram"), que daria "250 kilos" en vez de
+        #  "cuarto kilo" o "250 gramos". Se mantiene el original en
+        #  arguments["_cantidad_original"] por si el caller lo necesita.
+        arguments["cantidad"] = cantidad_normalizada
         arguments["unidad"] = unidad_catalogo
         arguments["cantidad_normalizada"] = cantidad_normalizada
+        arguments["_cantidad_original"] = cant
+        arguments["_unidad_original"] = unidad_usuario or unidad_catalogo
 
     elif tool_name == "confirmar_movimiento":
         producto_id = None

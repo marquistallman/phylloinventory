@@ -1,6 +1,6 @@
 # Phylloinventory — Documentacion de Implementacion
 
-## Estado: Fases 1-7 completadas
+## Estado: Fases 1-8 completadas
 
 ---
 
@@ -573,3 +573,201 @@ Dockerfile del api-gateway (apt-get).
 3. La PWA consume `/api/audio/transcribir` para STT y `/api/audio/speak`
    para TTS sin saber que backend esta activo. `GET /api/audio/voices`
    alimenta el selector de voces.
+
+### 7.9 Narrador (textos naturales para TTS)
+
+**Problema**: los mensajes TTS originales sonaban roboticos
+("Se agregaron 5 kilos de harina. Stock actual: 125.5, en Bodega 1.").
+Para el uso constante de la demo (voz como canal principal) hace falta
+algo mas natural y conversacional.
+
+**Solucion**: modulo `services/llm_common/narrator.py` + endpoint
+`POST /api/narrate`. Dos modos seleccionables runtime:
+
+| Modo | Backend | Velocidad | Costo | Calidad |
+|---|---|---|---|---|
+| `default` | templates hardcodeados con variaciones aleatorias | < 1ms | 0 | Buena (es-AR natural) |
+| `llm` | OpenRouter con modelo configurable (default `google/gemma-4-31b-it:free`) | 1-3s | 0 (free tier) | Excelente |
+
+Eventos soportados (9):
+- `aceptada`, `sospechosa`, `confirmada`, `rechazada`, `consulta`,
+  `sospechosos`, `invalid`, `no_action`, `registrar_manual`
+
+Ejemplos de salida (modo default):
+- `aceptada` con `{producto: "papa", cantidad: 5, unidad: "kg", stock_actual: 130}`:
+  - "Listo, sumamos 5 kilos de papa. Te quedan 130 kilos en Bodega 1."
+  - "Buenísimo, sumamos 5 kilos de papa. Te quedan 130 kilos en Bodega 1."
+  - "Anotado, sumamos 5 kilos de papa. Te quedan 130 kilos en Bodega 1."
+  (elige una variación al azar)
+- `sospechosa` con `puntaje_riesgo: 4.2`: "Pará, ingreso de 50 kilos de
+  harina se va de mambo, 4.2 sigmas. Te lo confirmo o lo descarto?"
+- `consulta` con `{stock_actual: 130, unidad: "kg", bodega: "Bodega 1"}`:
+  "Encontre esto: en Bodega 1 hay 130 kilos de papa."
+
+Con `narrator=llm` + `OPENROUTER_API_KEY` configurado, el gateway envia el
+template al LLM con un system prompt en espanol rioplatense que pide
+reformular el mensaje de forma conversacional. Cache en memoria (256
+entradas, LRU simple) para no martillar la API en eventos repetidos.
+
+**Endpoints**:
+- `POST /api/narrate` body `{event, data}` -> `{text, event, backend, model}`
+- `GET /api/config` ahora incluye `narrator`, `narrator_model`, `narrator_override`, `narrator_model_override`
+- `POST /api/config` acepta campos `narrator` y `narrator_model`
+
+**Runtime**:
+```bash
+# Activar narrador LLM (Gemma 4 31B free por default)
+curl -X POST http://localhost:8200/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"narrator": "llm"}'
+
+# Cambiar el modelo del narrador
+curl -X POST http://localhost:8200/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"narrator_model": "deepseek/deepseek-v4-flash"}'
+
+# Volver a templates
+curl -X POST http://localhost:8200/api/config \
+  -H "Content-Type: application/json" \
+  -d '{"narrator": "default"}'
+```
+
+**CLI**: el `cloud` y el `cloud status` ahora muestran el narrador activo.
+Comando nuevo: `narrate <evento> k=v...` para probar (e.g.,
+`narrate aceptada producto=papa cantidad=5 unidad=kg stock_actual=130`).
+El CLI ya no construye frases localmente — siempre llama al gateway.
+
+### 7.10 Selector de modelos (`/api/models`)
+
+**Problema**: cambiar el modelo de OpenRouter requeria reiniciar el
+servicio (variable de entorno) y el usuario no tenia visibilidad de que
+modelos estaban disponibles.
+
+**Solucion**: endpoint dedicado `/api/models` con GET (lista) y POST
+(selecciona).
+
+**`GET /api/models`**:
+- Sin params: lista curada de 5 modelos recomendados (DeepSeek V4 Flash/Pro,
+  Gemma 4 31B/26B free, Claude 3.5 Haiku) con `cost_in`, `cost_out`, `free`,
+  `tagline` para cada uno.
+- `?all=true`: si hay `OPENROUTER_API_KEY`, lista los 350+ modelos
+  disponibles en OpenRouter con sus precios.
+- `?category=narrator|llm`: filtra por categoria.
+- Siempre incluye `current: {narrator_backend, narrator_model, llm}` y
+  `defaults: {...}`.
+
+**`POST /api/models/select`**:
+- Body: `{category: "narrator", model: "<slug>"}` (o `model: null`/`auto`
+  para volver al default).
+- Equivale a `POST /api/config {narrator_model: ...}` pero con un endpoint
+  dedicado y self-documenting.
+
+**CLI**:
+```bash
+models                  # lista curada
+models all              # lista completa de OpenRouter
+models select <slug>    # cambia el modelo del narrador
+models select auto      # vuelve al default
+```
+
+### 7.11 Archivos modificados en sub-fase 7.9-7.10
+
+| Archivo | Cambio |
+|---|---|
+| `services/llm_common/narrator.py` | nuevo (~220 lineas): templates con variaciones + LLM rewriter |
+| `services/api-gateway/main.py` | +`/api/narrate` (POST), +`/api/models` (GET), +`/api/models/select` (POST), +narrator state runtime, +NARRATOR_BACKEND/NARRATOR_MODEL env |
+| `docker-compose.yml` | +NARRATOR_BACKEND, NARRATOR_MODEL, OPENROUTER_API_KEY, OPENROUTER_BASE en api-gateway |
+| `.env.example` | +seccion Narrador |
+| `src/api_client.py` | +`narrate()`, +`list_models()`, +`select_model()` |
+| `src/cli.py` | refactor `_narrate_*` para llamar al gateway, +comandos `models` y `narrate` demo, banner muestra narrador activo, `cloud status` incluye narrador |
+| `PLAN.md` | +secciones 7.9-7.11 |
+
+---
+
+## Fase 8 — Manager CLI + Constraints de DB
+
+### 8.1 Trigger: enteros solo para unidad "Unidad"
+
+**Problema**: la DB aceptaba decimales en `cantidad_*` para cualquier producto,
+incluso los que tienen `unidad = "Unidad"` (que son cantidades discretas: 5
+unidades, no 5.5). Esto permitia inconsistencia: stock_resultante podia
+ser 5.7 tornillos.
+
+**Solucion**: trigger `check_cantidad_unidad()` en plpgsql que:
+- Para cada INSERT/UPDATE en las tablas relevantes, busca la unidad del
+  producto via JOIN con `unidades`.
+- Si la unidad es "Unidad", valida que los campos de cantidad sean
+  enteros exactos (`valor = ROUND(valor)`).
+- Si la unidad es "Kilogram", "Liter" u otra, deja pasar decimales.
+
+**Tablas y campos cubiertos**:
+- `inventario_movimientos.cantidad_reportada`
+- `registros_conteo.cantidad_contada` y `cantidad_normalizada`
+- `pending_evaluations.cantidad`
+- `stock.stock_actual`
+
+**Excepcion**: `IntegrityConstraintViolation` con mensaje claro:
+```
+inventario_movimientos.cantidad_reportada debe ser entero para productos
+con unidad "Unidad" (producto_id=42, recibido: 5.5)
+```
+
+**Idempotencia**: `CREATE OR REPLACE FUNCTION` + `DROP TRIGGER IF EXISTS`,
+asi corre tanto en init.sql (fresh deploy) como en migraciones.
+
+### 8.2 Migraciones SQL
+
+Directorio `db/migrations/` con archivos numerados:
+- `001_normalize_3fn.sql` — la 3FN que ya existia
+- `002_cantidad_unidad_integer.sql` — el trigger nuevo
+
+Tabla `_migrations` (creada on demand por el manager) trackea que ya
+estan aplicadas para no re-ejecutar.
+
+### 8.3 Manager CLI (`src/manager.py`)
+
+CLI admin para correr **en el servidor**. Separado del CLI de inventario
+(`src/cli.py`) que usa el usuario final. Diseñado para sysadmins que
+gestionan el deploy.
+
+**Comandos** (12):
+
+| Comando | Proposito |
+|---|---|
+| `status` | docker ps + gateway health + config activa |
+| `config show` | muestra .env con secretos enmascarados |
+| `config set KEY=VALUE ...` | setea variables (con confirmacion o `--yes`) |
+| `config unset KEY ...` | remueve variables |
+| `keys` | lista solo API keys/secrets (filtrado) |
+| `rebuild [services...]` | `docker compose build + up -d` |
+| `restart [services...]` | `docker compose restart` |
+| `up` | arranca todo con profiles activos |
+| `down` | para todo (con doble confirmacion) |
+| `logs <service> [-n N] [-f]` | tail de logs |
+| `migrate` | aplica migraciones SQL pendientes |
+| `models` / `models select <slug>` | lista / cambia modelos OpenRouter via gateway |
+
+**Seguridad**:
+- Secretos enmascarados en outputs (mask `sk-...` como `sk-t****7890`).
+- Confirmacion interactiva en acciones destructivas (`config set`,
+  `rebuild`, `down`). `--yes` la skipea.
+- `down` pide escribir "yes" literal (no "y"), por destructivo.
+- `.env` se preserva con la estructura de `.env.example` (secciones con
+  comentarios); keys nuevas se appendan al final con un header
+  "Agregadas por manager".
+
+**Output**: usa `rich` (Table, Console) si esta disponible, si no
+fallback a `print` plano.
+
+**Conexion DB**: lee `DATABASE_URL` del ambiente (default
+`postgres://cactus:cactus@127.0.0.1:5432/inventario`).
+
+### 8.4 Archivos modificados/creados en Fase 8
+
+| Archivo | Cambio |
+|---|---|
+| `db/init.sql` | +`check_cantidad_unidad()` function + 4 triggers (movimientos, registros, pending, stock) |
+| `db/migrations/002_cantidad_unidad_integer.sql` | nuevo: misma logica, para DBs existentes |
+| `db/migrations/001_normalize_3fn.sql` | (pre-existente, ahora trackeado por el manager) |
+| `src/manager.py` | nuevo (~430 lineas): CLI admin completo |
+| `PLAN.md` | +secciones 8.1-8.4 |

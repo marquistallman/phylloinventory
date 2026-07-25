@@ -222,3 +222,41 @@ async def list_voices() -> dict:
         r = await client.get(f"{GATEWAY_URL}/api/audio/voices")
         r.raise_for_status()
         return r.json()
+
+
+async def narrate(event: str, data: dict | None = None, timeout: float = 5.0) -> dict:
+    """Pide al gateway que reformule un evento estructurado en espanol natural.
+
+    Por default: 5s de timeout (suficiente para templates, justo para LLM).
+    Subir el timeout si se usa narrador LLM y la red esta lenta.
+    Retorna {text, event, backend, model}.
+    """
+    payload = {"event": event, "data": data or {}}
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        r = await client.post(f"{GATEWAY_URL}/api/narrate", json=payload)
+        r.raise_for_status()
+        return r.json()
+
+
+async def list_models(all: bool = False, category: str | None = None) -> dict:
+    """Lista modelos disponibles (curados por default, ?all=true para todos)."""
+    params: dict[str, Any] = {}
+    if all:
+        params["all"] = "true"
+    if category:
+        params["category"] = category
+    async with httpx.AsyncClient(timeout=15) as client:
+        r = await client.get(f"{GATEWAY_URL}/api/models", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+async def select_model(category: str, model: str | None = None) -> dict:
+    """Cambia el modelo activo de una categoria en runtime."""
+    payload: dict[str, Any] = {"category": category}
+    if model is not None:
+        payload["model"] = model
+    async with httpx.AsyncClient(timeout=5) as client:
+        r = await client.post(f"{GATEWAY_URL}/api/models/select", json=payload)
+        r.raise_for_status()
+        return r.json()
