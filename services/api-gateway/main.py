@@ -148,24 +148,109 @@ async def status(pending_id: int):
     return row
 
 
+@app.get("/catalog")
+async def catalog(bodega_id: int | None = None):
+    """Catalogo de productos (1 fila por producto abstracto).
+
+    Sin bodega_id: vista global (lo que muestra el CLI por defecto).
+    Con bodega_id: igual pero acotado a los productos que tienen stock en
+    esa bodega (util para sugerir candidatos a contar).
+    """
+    if bodega_id is not None:
+        return await fetch(
+            """
+            SELECT DISTINCT
+                pc.id, pc.nombre, pc.codigo_articulo, pc.unidad,
+                pc.q_proceso, pc.r_medicion, pc.umbral_sigma
+            FROM productos_catalogo pc
+            JOIN stock s ON s.producto_id = pc.id
+            WHERE s.bodega_id = $1
+            ORDER BY pc.nombre
+            """,
+            bodega_id,
+        )
+    return await fetch(
+        """SELECT id, nombre, codigo_articulo, unidad,
+                  q_proceso, r_medicion, umbral_sigma
+           FROM productos_catalogo
+           ORDER BY nombre"""
+    )
+
+
 @app.get("/inventory")
-async def inventory(producto: str | None = None):
-    if producto:
+async def inventory(
+    producto: str | None = None,
+    bodega_id: int | None = None,
+):
+    """Stock por (producto, bodega). Sin filtros -> catalogo (no 1400 filas).
+
+    Comportamiento:
+      sin params           -> 1 fila por producto (sin stock per-bodega)
+      ?producto=X          -> stock de X en todas las bodegas donde exista
+      ?bodega_id=Y         -> stock de todos los productos en bodega Y
+      ?producto=X&bodega=Y -> fila unica
+    """
+    if producto and bodega_id is not None:
         row = await fetchrow(
-            "SELECT nombre, stock_actual, media_kalman, varianza_kalman FROM productos WHERE nombre = $1",
-            producto,
+            """SELECT peb.nombre, peb.bodega_id, b.nombre AS bodega,
+                      peb.unidad, peb.stock_actual, peb.media_kalman, peb.varianza_kalman
+               FROM productos_en_bodega peb
+               JOIN bodegas b ON b.id = peb.bodega_id
+               WHERE peb.nombre = $1 AND peb.bodega_id = $2""",
+            producto, bodega_id,
         )
         if not row:
-            raise HTTPException(404, f"producto '{producto}' no encontrado")
+            raise HTTPException(404, f"producto '{producto}' no encontrado en bodega {bodega_id}")
         return row
+
+    if producto:
+        rows = await fetch(
+            """SELECT peb.nombre, peb.bodega_id, b.nombre AS bodega,
+                      peb.unidad, peb.stock_actual, peb.media_kalman, peb.varianza_kalman
+               FROM productos_en_bodega peb
+               JOIN bodegas b ON b.id = peb.bodega_id
+               WHERE peb.nombre = $1
+               ORDER BY b.nombre""",
+            producto,
+        )
+        if not rows:
+            raise HTTPException(404, f"producto '{producto}' no encontrado")
+        return rows
+
+    if bodega_id is not None:
+        return await fetch(
+            """SELECT peb.nombre, peb.codigo_articulo, peb.unidad,
+                      peb.stock_actual, peb.media_kalman, peb.varianza_kalman
+               FROM productos_en_bodega peb
+               WHERE peb.bodega_id = $1
+               ORDER BY peb.nombre""",
+            bodega_id,
+        )
+
+    #  Sin filtros: devuelvo el catalogo (1 fila por producto, sin duplicar
+    #  por bodega). Esto arregla el "el CLI carga 1400 filas" — antes
+    #  haciamos SELECT * FROM productos sin filtro y explotaba con 48 bodegas.
     return await fetch(
-        "SELECT nombre, stock_actual, media_kalman, varianza_kalman FROM productos ORDER BY nombre"
+        """SELECT id, nombre, codigo_articulo, unidad
+           FROM productos_catalogo
+           ORDER BY nombre"""
     )
 
 
 @app.get("/sospechosos")
 async def sospechosos(producto: str | None = None):
     return await fetch("SELECT * FROM investigar_sospechosos($1)", producto)
+
+
+@app.get("/api/bodegas")
+async def list_bodegas(q: str | None = None):
+    """Lista todas las bodegas. Opcional: ?q= filtra por nombre (ILIKE)."""
+    if q:
+        return await fetch(
+            "SELECT id, nombre FROM bodegas WHERE nombre ILIKE $1 ORDER BY nombre",
+            f"%{q}%",
+        )
+    return await fetch("SELECT id, nombre FROM bodegas ORDER BY nombre")
 
 
 # =====================================================================
@@ -203,7 +288,7 @@ async def iniciar_sesion(req: IniciarSesionRequest):
         raise HTTPException(500, "No se pudo crear la sesion")
 
     total_productos = await fetchrow(
-        "SELECT COUNT(*) AS total FROM productos WHERE bodega_id = $1",
+        "SELECT COUNT(*) AS total FROM productos_en_bodega WHERE bodega_id = $1",
         req.bodega_id,
     )
     return {
@@ -245,7 +330,7 @@ async def finalizar_sesion(req: FinalizarSesionRequest):
     )
 
     total_prods = await fetchrow(
-        "SELECT COUNT(*) AS total FROM productos WHERE bodega_id = $1",
+        "SELECT COUNT(*) AS total FROM productos_en_bodega WHERE bodega_id = $1",
         sesion["bodega_id"],
     )
 
@@ -283,7 +368,7 @@ async def estado_sesion(sesion_id: int):
     )
 
     total_prods = await fetchrow(
-        "SELECT COUNT(*) AS total FROM productos WHERE bodega_id = $1",
+        "SELECT COUNT(*) AS total FROM productos_en_bodega WHERE bodega_id = $1",
         sesion["bodega_id"],
     )
 
@@ -349,7 +434,9 @@ async def registrar_voz(req: RegistroVozRequest):
     if conteo:
         from llm_common.fuzzy_search import fuzzy_match_product
         candidatos = await fetch(
-            "SELECT id, nombre, unidad FROM productos WHERE bodega_id = $1",
+            """SELECT id, nombre, unidad
+               FROM productos_en_bodega
+               WHERE bodega_id = $1""",
             sesion["bodega_id"],
         )
         match = fuzzy_match_product(conteo["producto"], candidatos)
@@ -434,14 +521,15 @@ async def reporte_diferencias(sesion_id: int):
         """
         SELECT
             p.nombre,
-            p.unidad,
+            peb.unidad,
             p.codigo_articulo,
             rc.stock_sistema,
             rc.cantidad_normalizada AS stock_contado,
             (rc.cantidad_normalizada - rc.stock_sistema) AS diferencia,
             rc.decision_kalman
         FROM registros_conteo rc
-        JOIN productos p ON p.id = rc.producto_id
+        JOIN productos p            ON p.id = rc.producto_id
+        JOIN productos_en_bodega peb ON peb.producto_id = p.id AND peb.bodega_id = rc.bodega_id
         WHERE rc.sesion_id = $1
         ORDER BY ABS(rc.cantidad_normalizada - rc.stock_sistema) DESC
         """,
@@ -453,16 +541,20 @@ async def reporte_diferencias(sesion_id: int):
         """
         SELECT
             p.nombre,
-            p.unidad,
+            peb.unidad,
             p.codigo_articulo,
-            p.stock_actual AS stock_sistema,
+            peb.stock_actual AS stock_sistema,
             NULL::FLOAT AS stock_contado,
             NULL::FLOAT AS diferencia,
             'no_contado' AS decision_kalman
-        FROM productos p
-        WHERE p.bodega_id = $1
-        AND p.id NOT IN (
-            SELECT producto_id FROM registros_conteo WHERE sesion_id = $2
+        FROM productos_en_bodega peb
+        JOIN productos p ON p.id = peb.producto_id
+        WHERE peb.bodega_id = $1
+        AND NOT EXISTS (
+            SELECT 1 FROM registros_conteo rc
+            WHERE rc.producto_id = peb.producto_id
+              AND rc.bodega_id   = peb.bodega_id
+              AND rc.sesion_id   = $2
         )
         ORDER BY p.nombre
         """,
@@ -485,7 +577,7 @@ async def reporte_sospechosos(sesion_id: int):
         """
         SELECT
             p.nombre,
-            p.unidad,
+            peb.unidad,
             rc.cantidad_normalizada AS cantidad_contada,
             rc.stock_sistema,
             (rc.cantidad_normalizada - rc.stock_sistema) AS diferencia,
@@ -494,8 +586,9 @@ async def reporte_sospechosos(sesion_id: int):
             pe.decision,
             pe.created_at
         FROM registros_conteo rc
-        JOIN productos p ON p.id = rc.producto_id
-        JOIN pending_evaluations pe ON pe.id = rc.pending_id
+        JOIN productos p            ON p.id = rc.producto_id
+        JOIN productos_en_bodega peb ON peb.producto_id = p.id AND peb.bodega_id = rc.bodega_id
+        JOIN pending_evaluations pe  ON pe.id = rc.pending_id
         WHERE rc.sesion_id = $1 AND rc.decision_kalman = 'SOSPECHOSA'
         ORDER BY ABS(pe.residual) DESC
         """,

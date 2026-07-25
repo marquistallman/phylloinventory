@@ -67,14 +67,15 @@ def show_banner(backend: str, voice_ok: bool = False) -> None:
                 f"Session: [dim]{SESSION_ID}[/dim][/dim]\n"
                 f"[dim]{voice_line}[/dim]\n"
                 "[dim]Kalman evaluado por worker Go - Cola en PostgreSQL[/dim]\n\n"
-                "[yellow]Comandos:[/yellow]\n"
-                "  texto libre             -> enviar al LLM\n"
-                "  voz                     -> dictar por microfono (WS)\n"
-                "  inventario              -> ver stock\n"
-                "  sospechosos [producto]  -> auditoria Kalman\n"
-                "  salir / exit / q        -> cerrar\n"
-                "  ayuda / help            -> mostrar este banner\n"
-                "  limpiar / clear         -> limpiar pantalla"
+            "[yellow]Comandos:[/yellow]\n"
+            "  texto libre             -> enviar al LLM\n"
+            "  voz                     -> dictar por microfono (WS)\n"
+            "  inventario              -> ver catalogo (1 fila x producto)\n"
+            "  inventario <bodega>     -> stock por bodega\n"
+            "  sospechosos [producto]  -> auditoria Kalman\n"
+            "  salir / exit / q        -> cerrar\n"
+            "  ayuda / help            -> mostrar este banner\n"
+            "  limpiar / clear         -> limpiar pantalla"
             ),
             vertical="middle",
         ),
@@ -91,11 +92,27 @@ def show_inventory(rows: list[dict]) -> None:
     table.add_column("Kalman mu", justify="right")
     table.add_column("s2", justify="right")
     for r in rows:
+        if "stock_actual" not in r:
+            r = {**r, "stock_actual": "-", "media_kalman": 0, "varianza_kalman": 0}
         table.add_row(
             r["nombre"],
             str(r["stock_actual"]),
             f"{r['media_kalman']:.1f}",
             f"{r['varianza_kalman']:.1f}",
+        )
+    console.print(table)
+
+
+def show_catalog(rows: list[dict]) -> None:
+    table = Table(title="Catalogo de Productos", box=box.SIMPLE_HEAVY, border_style="cyan")
+    table.add_column("Producto", style="bold")
+    table.add_column("Unidad")
+    table.add_column("Codigo", justify="right")
+    for r in rows:
+        table.add_row(
+            r["nombre"],
+            r.get("unidad", "-"),
+            str(r.get("codigo_articulo") or "-"),
         )
     console.print(table)
 
@@ -408,10 +425,10 @@ async def main_async(args: argparse.Namespace) -> int:
 
     show_banner(backend, voice_ok=voice_ok)
     try:
-        inv = await api_client.get_inventory()
-        if isinstance(inv, list):
+        cat = await api_client.get_catalog()
+        if cat:
             console.print()
-            show_inventory(inv)
+            show_catalog(cat)
             console.print()
     except Exception:
         pass
@@ -449,8 +466,22 @@ async def main_async(args: argparse.Namespace) -> int:
             continue
         if low == "inventario":
             try:
-                inv = await api_client.get_inventory()
-                show_inventory(inv)
+                cat = await api_client.get_catalog()
+                show_catalog(cat)
+            except Exception as e:
+                console.print(f"[red]Error: {e}[/red]")
+            console.print()
+            continue
+        if low.startswith("inventario "):
+            parts = user_input.split(maxsplit=1)
+            q = parts[1].strip()
+            try:
+                bid = await api_client.find_bodega(q)
+                if bid is None:
+                    console.print(f"[yellow]Bodega '{q}' no encontrada. 'inventario' muestra el catálogo.[/yellow]")
+                else:
+                    inv = await api_client.get_inventory(bodega_id=bid)
+                    show_inventory(inv)
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")
             console.print()

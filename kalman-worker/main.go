@@ -77,6 +77,7 @@ type Pending struct {
 	SessionID   string
 	ToolName    string
 	ProductoID  int32
+	BodegaID    int32
 	Tipo        string
 	Cantidad    float64
 	Payload     []byte
@@ -257,19 +258,21 @@ func (wp *WorkerPool) processOne(workerID int) (bool, error) {
 	defer tx.Rollback(wp.ctx)
 
 	var p Pending
-	//  NOTA: producto_id/cantidad son NULL en filas de confirmar_movimiento;
-	//  sin COALESCE el scan a int32 falla y la fila envenena la cola
-	//  (ORDER BY id -> siempre es la primera -> head-of-line blocking).
+	//  NOTA: producto_id/cantidad/bodega_id son NULL en filas de
+	//  confirmar_movimiento; sin COALESCE el scan a int32 falla y la fila
+	//  envenena la cola (ORDER BY id -> siempre es la primera ->
+	//  head-of-line blocking).
 	err = tx.QueryRow(wp.ctx, `
 		SELECT id, COALESCE(session_id,''), tool_name,
-		       COALESCE(producto_id,0), COALESCE(tipo,''), COALESCE(cantidad,0),
+		       COALESCE(producto_id,0), COALESCE(bodega_id,0),
+		       COALESCE(tipo,''), COALESCE(cantidad,0),
 		       payload::text
 		FROM pending_evaluations
 		WHERE status = 'PENDING'
 		ORDER BY id
 		FOR UPDATE SKIP LOCKED
 		LIMIT 1
-	`).Scan(&p.ID, &p.SessionID, &p.ToolName, &p.ProductoID, &p.Tipo, &p.Cantidad, &p.Payload)
+	`).Scan(&p.ID, &p.SessionID, &p.ToolName, &p.ProductoID, &p.BodegaID, &p.Tipo, &p.Cantidad, &p.Payload)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return false, nil
@@ -325,8 +328,8 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 	var k KalmanResult
 	err := tx.QueryRow(wp.ctx, `
 		SELECT decision, residual, umbral, media_actual, varianza_actual, stock_proyectado, puntaje_riesgo
-		FROM kalman_evaluar($1, $2, $3)
-	`, p.ProductoID, p.Tipo, p.Cantidad).Scan(
+		FROM kalman_evaluar($1, $2, $3, $4)
+	`, p.ProductoID, p.BodegaID, p.Tipo, p.Cantidad).Scan(
 		&k.Decision, &k.Residual, &k.Umbral,
 		&k.MediaActual, &k.VarianzaActual, &k.StockProyectado, &k.PuntajeRiesgo,
 	)
@@ -341,8 +344,8 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 	case "PASA":
 		var movID int32
 		err := tx.QueryRow(wp.ctx, `
-			SELECT aplicar_movimiento_aceptado($1, $2, $3, $4, $5)
-		`, p.ProductoID, p.Tipo, p.Cantidad, k.Residual, k.Umbral).Scan(&movID)
+			SELECT aplicar_movimiento_aceptado($1, $2, $3, $4, $5, $6)
+		`, p.ProductoID, p.BodegaID, p.Tipo, p.Cantidad, k.Residual, k.Umbral).Scan(&movID)
 		if err != nil {
 			return fmt.Errorf("aplicar_movimiento: %w", err)
 		}

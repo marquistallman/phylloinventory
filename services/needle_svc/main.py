@@ -360,12 +360,12 @@ async def infer(req: InferRequest):
     for call in calls:
         try:
             if call.name in ("agregar_inventario", "remover_inventario", "confirmar_movimiento"):
-pid = await enqueue_pending(
-                        session_id=session_id,
-                        tool_name=call.name,
-                        arguments=call.arguments,
-                        bodega_id=req.bodega_id,
-                    )
+                pid = await enqueue_pending(
+                    session_id=session_id,
+                    tool_name=call.name,
+                    arguments=call.arguments,
+                    bodega_id=req.bodega_id,
+                )
                 pending.append(PendingCall(pending_id=pid, tool_name=call.name, arguments=call.arguments))
                 logger.info("enqueued pending_id=%d tool=%s args=%s", pid, call.name, call.arguments)
             else:

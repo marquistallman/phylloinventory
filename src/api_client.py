@@ -53,9 +53,27 @@ async def poll_until_resolved(pending_id: int, timeout_s: float = POLL_TIMEOUT_S
     return {"status": "TIMEOUT"}
 
 
-async def get_inventory(producto: str | None = None) -> Any:
+async def get_inventory(producto: str | None = None, bodega_id: int | None = None) -> Any:
+    """Sin filtros -> catalogo (1 fila por producto, ~30 filas).
+
+    Con bodega_id -> stock por bodega. Con producto -> stock del producto.
+    """
+    params: dict[str, Any] = {}
+    if producto:
+        params["producto"] = producto
+    if bodega_id is not None:
+        params["bodega_id"] = bodega_id
     async with httpx.AsyncClient(timeout=5) as client:
-        r = await client.get(f"{GATEWAY_URL}/inventory", params={"producto": producto} if producto else {})
+        r = await client.get(f"{GATEWAY_URL}/inventory", params=params)
+        r.raise_for_status()
+        return r.json()
+
+
+async def get_catalog(bodega_id: int | None = None) -> list[dict]:
+    """Catalogo abstracto de productos (sin repeticion por bodega)."""
+    params = {"bodega_id": bodega_id} if bodega_id is not None else {}
+    async with httpx.AsyncClient(timeout=5) as client:
+        r = await client.get(f"{GATEWAY_URL}/catalog", params=params)
         r.raise_for_status()
         return r.json()
 
@@ -65,3 +83,36 @@ async def get_sospechosos(producto: str | None = None) -> list[dict]:
         r = await client.get(f"{GATEWAY_URL}/sospechosos", params={"producto": producto} if producto else {})
         r.raise_for_status()
         return r.json()
+
+
+async def list_bodegas() -> list[dict]:
+    async with httpx.AsyncClient(timeout=5) as client:
+        r = await client.get(f"{GATEWAY_URL}/api/bodegas")
+        r.raise_for_status()
+        return r.json()
+
+
+async def find_bodega(query: str) -> int | None:
+    """Resuelve nombre -> id de bodega (fuzzy). None si no hay match."""
+    try:
+        bodegas = await list_bodegas()
+    except Exception:
+        return None
+    if not bodegas:
+        return None
+    q = query.lower().strip()
+    # exacto primero
+    for b in bodegas:
+        if b["nombre"] == q:
+            return int(b["id"])
+    # prefijo
+    for b in bodegas:
+        if b["nombre"].startswith(q):
+            return int(b["id"])
+    # fuzzy (levenshtein simple)
+    try:
+        from llm_common.fuzzy_search import fuzzy_match
+    except Exception:
+        return None
+    m = fuzzy_match(query, [{"id": b["id"], "nombre": b["nombre"]} for b in bodegas])
+    return int(m["id"]) if m else None

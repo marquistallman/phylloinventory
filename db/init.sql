@@ -1,40 +1,137 @@
 -- =====================================================================
---  Cactus Inventory — DB init (microservicios)
---  Sin triggers. Toda la logica Kalman la ejecuta el kalman-worker (Go).
---  La DB expone solo funciones puras y una tabla-cola.
+--  Cactus Inventory — DB init (3FN)
+--
+--  Modelo:
+--    unidades               (lookup, evita VARCHAR libre)
+--    bodegas                (ubicaciones fisicas)
+--    productos              (catalogo abstracto, 1 fila por producto)
+--    stock                  (estado por (producto, bodega))
+--
+--  Views:
+--    productos_en_bodega    (forma antigua, 1 fila por (producto, bodega))
+--    productos_catalogo     (1 fila por producto abstracto, sin bodega)
+--    stock_actual           (join legible para queries de inventario)
+--
+--  Las funciones kalman_* toman (producto_id, bodega_id, ...).
+--  pending_evaluations y registros_conteo almacenan bodega_id explicitamente.
 -- =====================================================================
 
 -- =====================================================================
---  Bodegas (ubicaciones fisicas del inventario)
+--  Unidades
 -- =====================================================================
-CREATE TABLE bodegas (
+CREATE TABLE IF NOT EXISTS unidades (
+    id     SERIAL PRIMARY KEY,
+    nombre VARCHAR(20) UNIQUE NOT NULL
+);
+INSERT INTO unidades (nombre) VALUES ('Unidad'), ('Kilogram'), ('Liter')
+ON CONFLICT (nombre) DO NOTHING;
+
+-- =====================================================================
+--  Bodegas
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS bodegas (
     id          SERIAL PRIMARY KEY,
     nombre      VARCHAR(150) UNIQUE NOT NULL,
     creado_en   TIMESTAMP DEFAULT NOW()
 );
+INSERT INTO bodegas (nombre) VALUES ('bodega_default')
+ON CONFLICT (nombre) DO NOTHING;
 
-INSERT INTO bodegas (nombre) VALUES ('bodega_default');
-
-CREATE TABLE productos (
+-- =====================================================================
+--  Productos (catalogo abstracto, 1 fila por producto)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS productos (
     id              SERIAL PRIMARY KEY,
-    nombre          VARCHAR(150) NOT NULL,
-    bodega_id       INTEGER NOT NULL REFERENCES bodegas(id) DEFAULT 1,
+    nombre          VARCHAR(150) UNIQUE NOT NULL,
     codigo_articulo VARCHAR(20),
-    unidad          VARCHAR(20) NOT NULL DEFAULT 'Unidad',
-    stock_actual    FLOAT NOT NULL DEFAULT 0,
-    media_kalman    FLOAT NOT NULL DEFAULT 0,
-    varianza_kalman FLOAT NOT NULL DEFAULT 100.0,
+    unidad_id       INTEGER NOT NULL REFERENCES unidades(id) DEFAULT 1,
     q_proceso       FLOAT NOT NULL DEFAULT 5.0,
     r_medicion      FLOAT NOT NULL DEFAULT 1.0,
     umbral_sigma    FLOAT NOT NULL DEFAULT 2.0,
-    creado_en       TIMESTAMP DEFAULT NOW(),
-    actualizado_en  TIMESTAMP DEFAULT NOW(),
-    UNIQUE (nombre, bodega_id)
+    creado_en       TIMESTAMP DEFAULT NOW()
 );
 
-CREATE TABLE inventario_movimientos (
+-- =====================================================================
+--  Stock (estado por bodega)
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS stock (
+    producto_id     INTEGER NOT NULL REFERENCES productos(id) ON DELETE CASCADE,
+    bodega_id       INTEGER NOT NULL REFERENCES bodegas(id)  ON DELETE CASCADE,
+    stock_actual    FLOAT NOT NULL DEFAULT 0,
+    media_kalman    FLOAT NOT NULL DEFAULT 0,
+    varianza_kalman FLOAT NOT NULL DEFAULT 100.0,
+    creado_en       TIMESTAMP DEFAULT NOW(),
+    actualizado_en  TIMESTAMP DEFAULT NOW(),
+    PRIMARY KEY (producto_id, bodega_id)
+);
+CREATE INDEX IF NOT EXISTS idx_stock_bodega ON stock (bodega_id);
+
+-- =====================================================================
+--  Views (compatibilidad + consultas limpias)
+-- =====================================================================
+
+-- productos_en_bodega: replica la forma de la antigua tabla productos.
+-- Usar solo donde realmente se necesita el (producto, bodega) explicito.
+CREATE OR REPLACE VIEW productos_en_bodega AS
+SELECT
+    s.producto_id                                   AS id,
+    p.nombre,
+    p.codigo_articulo,
+    u.nombre                                        AS unidad,
+    s.bodega_id,
+    b.nombre                                        AS bodega,
+    s.stock_actual,
+    s.media_kalman,
+    s.varianza_kalman,
+    p.q_proceso,
+    p.r_medicion,
+    p.umbral_sigma,
+    s.creado_en,
+    s.actualizado_en
+FROM stock s
+JOIN productos p ON p.id = s.producto_id
+JOIN bodegas   b ON b.id = s.bodega_id
+JOIN unidades  u ON u.id = p.unidad_id;
+
+-- productos_catalogo: 1 fila por producto abstracto. Lo que consume el CLI
+-- en el inventario global (no repite por bodega).
+CREATE OR REPLACE VIEW productos_catalogo AS
+SELECT
+    p.id,
+    p.nombre,
+    p.codigo_articulo,
+    u.nombre        AS unidad,
+    p.q_proceso,
+    p.r_medicion,
+    p.umbral_sigma
+FROM productos p
+JOIN unidades  u ON u.id = p.unidad_id;
+
+-- stock_actual: vista legible join de todo.
+CREATE OR REPLACE VIEW stock_actual AS
+SELECT
+    s.producto_id,
+    p.nombre        AS producto,
+    p.codigo_articulo,
+    u.nombre        AS unidad,
+    s.bodega_id,
+    b.nombre        AS bodega,
+    s.stock_actual,
+    s.media_kalman,
+    s.varianza_kalman,
+    s.actualizado_en
+FROM stock s
+JOIN productos p ON p.id = s.producto_id
+JOIN bodegas   b ON b.id = s.bodega_id
+JOIN unidades  u ON u.id = p.unidad_id;
+
+-- =====================================================================
+--  Inventario movimientos
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS inventario_movimientos (
     id                   SERIAL PRIMARY KEY,
     producto_id          INTEGER NOT NULL REFERENCES productos(id),
+    bodega_id            INTEGER NOT NULL REFERENCES bodegas(id),
     tipo                 VARCHAR(10) NOT NULL CHECK (tipo IN ('entrada', 'salida')),
     cantidad_reportada   FLOAT NOT NULL CHECK (cantidad_reportada > 0),
     residual_kalman      FLOAT,
@@ -44,8 +141,13 @@ CREATE TABLE inventario_movimientos (
     stock_resultante     FLOAT,
     creado_en            TIMESTAMP DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_mov_producto ON inventario_movimientos (producto_id, bodega_id);
+CREATE INDEX IF NOT EXISTS idx_mov_fecha    ON inventario_movimientos (creado_en);
 
-CREATE TABLE auditoria_log (
+-- =====================================================================
+--  Auditoria
+-- =====================================================================
+CREATE TABLE IF NOT EXISTS auditoria_log (
     id              SERIAL PRIMARY KEY,
     movimiento_id   INTEGER REFERENCES inventario_movimientos(id),
     puntaje_riesgo  FLOAT NOT NULL,
@@ -54,15 +156,15 @@ CREATE TABLE auditoria_log (
 );
 
 -- =====================================================================
---  Cola: pending_evaluations
---  La llenan needle-service / openrouter-service.
---  La consume kalman-worker (Go) con SELECT ... FOR UPDATE SKIP LOCKED.
+--  Cola pending_evaluations
+--  bodega_id es obligatorio para movimientos (no para lecturas).
 -- =====================================================================
-CREATE TABLE pending_evaluations (
+CREATE TABLE IF NOT EXISTS pending_evaluations (
     id             BIGSERIAL PRIMARY KEY,
     session_id     TEXT,
     tool_name      VARCHAR(50) NOT NULL,
     producto_id    INTEGER REFERENCES productos(id),
+    bodega_id      INTEGER REFERENCES bodegas(id),
     tipo           VARCHAR(10),
     cantidad       FLOAT,
     payload        JSONB,
@@ -77,14 +179,13 @@ CREATE TABLE pending_evaluations (
     created_at     TIMESTAMP DEFAULT NOW(),
     resolved_at    TIMESTAMP
 );
-
-CREATE INDEX idx_pending_status ON pending_evaluations (status) WHERE status = 'PENDING';
-CREATE INDEX idx_pending_session ON pending_evaluations (session_id);
+CREATE INDEX IF NOT EXISTS idx_pending_status  ON pending_evaluations (status) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_pending_session ON pending_evaluations (session_id);
 
 -- =====================================================================
 --  Sesiones y registros de conteo
 -- =====================================================================
-CREATE TABLE sesiones_conteo (
+CREATE TABLE IF NOT EXISTS sesiones_conteo (
     id              SERIAL PRIMARY KEY,
     bodega_id       INTEGER NOT NULL REFERENCES bodegas(id),
     estado          VARCHAR(20) NOT NULL DEFAULT 'activa'
@@ -94,10 +195,11 @@ CREATE TABLE sesiones_conteo (
     finalizado_en   TIMESTAMP
 );
 
-CREATE TABLE registros_conteo (
+CREATE TABLE IF NOT EXISTS registros_conteo (
     id                    SERIAL PRIMARY KEY,
     sesion_id             INTEGER NOT NULL REFERENCES sesiones_conteo(id),
     producto_id           INTEGER NOT NULL REFERENCES productos(id),
+    bodega_id             INTEGER NOT NULL REFERENCES bodegas(id),
     cantidad_contada      FLOAT NOT NULL,
     unidad_usada          VARCHAR(20) NOT NULL,
     cantidad_normalizada  FLOAT NOT NULL,
@@ -107,24 +209,39 @@ CREATE TABLE registros_conteo (
     pending_id            BIGINT REFERENCES pending_evaluations(id),
     creado_en             TIMESTAMP DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_registros_sesion ON registros_conteo (sesion_id);
 
 -- =====================================================================
---  Seed
+--  Seed: catalogo base + stock en bodega_default
 -- =====================================================================
-INSERT INTO productos (nombre, bodega_id, unidad, stock_actual, media_kalman, varianza_kalman) VALUES
-    ('papa', 1, 'Kilogram', 50, 50, 100.0),
-    ('cebolla', 1, 'Kilogram', 30, 30, 100.0),
-    ('tomate', 1, 'Kilogram', 25, 25, 100.0),
-    ('zanahoria', 1, 'Kilogram', 40, 40, 100.0),
-    ('ajo', 1, 'Kilogram', 15, 15, 100.0);
+INSERT INTO productos (nombre, codigo_articulo, unidad_id) VALUES
+    ('papa',      NULL, (SELECT id FROM unidades WHERE nombre = 'Kilogram')),
+    ('cebolla',   NULL, (SELECT id FROM unidades WHERE nombre = 'Kilogram')),
+    ('tomate',    NULL, (SELECT id FROM unidades WHERE nombre = 'Kilogram')),
+    ('zanahoria', NULL, (SELECT id FROM unidades WHERE nombre = 'Kilogram')),
+    ('ajo',       NULL, (SELECT id FROM unidades WHERE nombre = 'Kilogram'))
+ON CONFLICT (nombre) DO NOTHING;
+
+INSERT INTO stock (producto_id, bodega_id, stock_actual, media_kalman, varianza_kalman)
+SELECT p.id, b.id, s.stock, s.stock, 100.0
+FROM (VALUES
+    ('papa',      50),
+    ('cebolla',   30),
+    ('tomate',    25),
+    ('zanahoria', 40),
+    ('ajo',       15)
+) AS s(nombre, stock)
+JOIN productos p ON p.nombre = s.nombre
+JOIN bodegas   b ON b.nombre = 'bodega_default'
+ON CONFLICT (producto_id, bodega_id) DO NOTHING;
 
 -- =====================================================================
 --  kalman_evaluar() — FUNCION PURA
---  NO escribe nada. Solo computa. El worker decide que hacer.
---  Retorna: decision (PASA|FALLA), residual, umbral, media, varianza, stock_proyectado
+--  Lee (producto, bodega) desde stock+productos.
 -- =====================================================================
 CREATE OR REPLACE FUNCTION kalman_evaluar(
     p_producto_id INTEGER,
+    p_bodega_id   INTEGER,
     p_tipo        VARCHAR,
     p_cantidad    FLOAT
 ) RETURNS TABLE (
@@ -144,15 +261,19 @@ DECLARE
     residual_v    FLOAT;
     nuevo_stock   FLOAT;
 BEGIN
-    SELECT * INTO prod FROM productos WHERE id = p_producto_id;
+    SELECT
+        s.stock_actual, s.media_kalman, s.varianza_kalman,
+        p.q_proceso, p.r_medicion, p.umbral_sigma
+    INTO prod
+    FROM stock s
+    JOIN productos p ON p.id = s.producto_id
+    WHERE s.producto_id = p_producto_id AND s.bodega_id = p_bodega_id;
+
     IF NOT FOUND THEN
         decision := 'ERROR';
-        residual := NULL;
-        umbral   := NULL;
-        media_actual := NULL;
-        varianza_actual := NULL;
-        stock_proyectado := NULL;
-        puntaje_riesgo := NULL;
+        residual := NULL;  umbral := NULL;
+        media_actual := NULL;  varianza_actual := NULL;
+        stock_proyectado := NULL;  puntaje_riesgo := NULL;
         RETURN NEXT;
         RETURN;
     END IF;
@@ -188,12 +309,11 @@ $$ LANGUAGE plpgsql;
 
 -- =====================================================================
 --  aplicar_movimiento_aceptado()
---  La llama el worker despues de kalman_evaluar() == 'PASA'.
---  Inserta el movimiento, actualiza Kalman state del producto.
---  Retorna el id del movimiento creado.
+--  Actualiza stock + inserta movimiento (con bodega_id explicito).
 -- =====================================================================
 CREATE OR REPLACE FUNCTION aplicar_movimiento_aceptado(
     p_producto_id INTEGER,
+    p_bodega_id   INTEGER,
     p_tipo        VARCHAR,
     p_cantidad    FLOAT,
     p_residual    FLOAT,
@@ -207,9 +327,16 @@ DECLARE
     nuevo_stock FLOAT;
     new_id      INTEGER;
 BEGIN
-    SELECT * INTO prod FROM productos WHERE id = p_producto_id FOR UPDATE;
+    SELECT s.stock_actual, s.media_kalman, s.varianza_kalman,
+           p.q_proceso, p.r_medicion
+    INTO prod
+    FROM stock s
+    JOIN productos p ON p.id = s.producto_id
+    WHERE s.producto_id = p_producto_id AND s.bodega_id = p_bodega_id
+    FOR UPDATE;
+
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'Producto % no existe', p_producto_id;
+        RAISE EXCEPTION 'Stock no existe para producto=% bodega=%', p_producto_id, p_bodega_id;
     END IF;
 
     IF p_tipo = 'entrada' THEN
@@ -222,18 +349,18 @@ BEGIN
     s_innov    := p_pred + prod.r_medicion;
     k_ganancia := p_pred / s_innov;
 
-    UPDATE productos SET
+    UPDATE stock SET
         media_kalman    = prod.media_kalman + k_ganancia * p_residual,
         varianza_kalman = (1.0 - k_ganancia) * p_pred,
         stock_actual    = nuevo_stock,
         actualizado_en  = NOW()
-    WHERE id = p_producto_id;
+    WHERE producto_id = p_producto_id AND bodega_id = p_bodega_id;
 
     INSERT INTO inventario_movimientos (
-        producto_id, tipo, cantidad_reportada,
+        producto_id, bodega_id, tipo, cantidad_reportada,
         residual_kalman, decision_kalman, umbral_usado, stock_resultante
     ) VALUES (
-        p_producto_id, p_tipo, p_cantidad,
+        p_producto_id, p_bodega_id, p_tipo, p_cantidad,
         p_residual, 'ACEPTADA', p_umbral, nuevo_stock
     )
     RETURNING id INTO new_id;
@@ -243,7 +370,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =====================================================================
---  investigar_sospechosos() — sin cambios
+--  investigar_sospechosos()
 -- =====================================================================
 CREATE OR REPLACE FUNCTION investigar_sospechosos(p_producto_nombre VARCHAR DEFAULT NULL)
 RETURNS TABLE(
@@ -268,7 +395,7 @@ BEGIN
         im.decision_kalman,
         im.creado_en
     FROM inventario_movimientos im
-    JOIN productos p ON p.id = im.producto_id
+    JOIN productos     p ON p.id = im.producto_id
     JOIN auditoria_log al ON al.movimiento_id = im.id
     WHERE (p_producto_nombre IS NULL OR p.nombre = p_producto_nombre)
     ORDER BY al.puntaje_riesgo DESC
@@ -277,9 +404,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =====================================================================
---  confirmar_movimiento() — usado por el worker al resolver una sospecha
---  Busca la fila PENDIENTE mas reciente del session_id o por movimiento_id
---  y la resuelve.
+--  confirmar_movimiento() — usa bodega_id de la propia pending
 -- =====================================================================
 CREATE OR REPLACE FUNCTION confirmar_movimiento(
     p_pending_id   BIGINT,
@@ -290,7 +415,7 @@ DECLARE
     prod    RECORD;
     p_pred  FLOAT;
     s_innov FLOAT;
-    k_gan  FLOAT;
+    k_gan   FLOAT;
     ns      FLOAT;
 BEGIN
     SELECT * INTO pend FROM pending_evaluations WHERE id = p_pending_id FOR UPDATE;
@@ -301,9 +426,23 @@ BEGIN
         RETURN 'Pending no esta en estado resoluble (' || pend.status || ')';
     END IF;
 
-    SELECT * INTO prod FROM productos WHERE id = pend.producto_id FOR UPDATE;
-
     IF p_confirmar THEN
+        IF pend.bodega_id IS NULL OR pend.producto_id IS NULL THEN
+            RETURN 'Pending sin bodega/producto';
+        END IF;
+
+        SELECT s.stock_actual, s.media_kalman, s.varianza_kalman,
+               p.q_proceso, p.r_medicion
+        INTO prod
+        FROM stock s
+        JOIN productos p ON p.id = s.producto_id
+        WHERE s.producto_id = pend.producto_id AND s.bodega_id = pend.bodega_id
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            RETURN 'Stock no existe para producto=' || pend.producto_id || ' bodega=' || pend.bodega_id;
+        END IF;
+
         IF pend.tipo = 'entrada' THEN
             ns := prod.stock_actual + pend.cantidad;
         ELSE
@@ -314,18 +453,18 @@ BEGIN
         s_innov := p_pred + prod.r_medicion;
         k_gan := p_pred / s_innov;
 
-        UPDATE productos SET
+        UPDATE stock SET
             media_kalman    = prod.media_kalman + k_gan * pend.residual,
             varianza_kalman = (1.0 - k_gan) * p_pred,
             stock_actual    = ns,
             actualizado_en  = NOW()
-        WHERE id = prod.id;
+        WHERE producto_id = pend.producto_id AND bodega_id = pend.bodega_id;
 
         INSERT INTO inventario_movimientos (
-            producto_id, tipo, cantidad_reportada,
+            producto_id, bodega_id, tipo, cantidad_reportada,
             residual_kalman, decision_kalman, umbral_usado, stock_resultante
         ) VALUES (
-            pend.producto_id, pend.tipo, pend.cantidad,
+            pend.producto_id, pend.bodega_id, pend.tipo, pend.cantidad,
             pend.residual, 'CONFIRMADA_MANUAL', pend.umbral, ns
         ) RETURNING id INTO pend.movimiento_id;
 
@@ -345,7 +484,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- =====================================================================
---  Notificacion opcional: el worker puede usar LISTEN/NOTIFY ademas del poll
+--  Notificacion opcional
 -- =====================================================================
 CREATE OR REPLACE FUNCTION notify_pending_insert()
 RETURNS TRIGGER AS $$
@@ -355,7 +494,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
---  Este trigger SI se permite: solo hace NOTIFY, no afecta data.
+DROP TRIGGER IF EXISTS trigger_notify_pending ON pending_evaluations;
 CREATE TRIGGER trigger_notify_pending
     AFTER INSERT ON pending_evaluations
     FOR EACH ROW
