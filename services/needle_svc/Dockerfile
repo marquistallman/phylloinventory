@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends git ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -8,8 +8,21 @@ WORKDIR /app
 COPY services/llm_common/  /app/llm_common/
 COPY services/needle_svc/  /app/needle_svc/
 
-RUN pip install --no-cache-dir -r /app/needle_svc/requirements.txt
-RUN pip install --no-cache-dir git+https://github.com/cactus-compute/needle.git
+#  Pin a un commit concreto: pip + git+https consulta PyPI antes de clonar
+#  y con el default (15s) suele hacer ReadTimeoutError. Subimos timeout,
+#  agregamos retries y clonamos primero para evitar la consulta a PyPI.
+ARG NEEDLE_COMMIT=6fdddb874dd6f46dabeea88d0bf239fc4a2474c4
+
+RUN pip install --no-cache-dir --default-timeout=300 --retries 5 \
+    -r /app/needle_svc/requirements.txt
+
+RUN git clone --depth 1 https://github.com/cactus-compute/needle.git /tmp/needle \
+ && cd /tmp/needle \
+ && git fetch --depth 1 origin ${NEEDLE_COMMIT} \
+ && git checkout ${NEEDLE_COMMIT} \
+ && pip install --no-cache-dir --default-timeout=300 --retries 5 /tmp/needle \
+ && rm -rf /tmp/needle
+
 RUN mkdir -p /app/checkpoints
 
 #  Para evitar conflicto entre el paquete pip "needle" y nuestro modulo

@@ -20,12 +20,19 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from llm_common.db import enqueue_pending, get_pending_status, close_pool
+#  Carga .env / .env.example ANTES de leer cualquier os.getenv().
+from llm_common.env_loader import load_env
+load_env()
+
+from llm_common.db import enqueue_pending, get_pending_status, close_pool, get_producto_nombres_bodega
 from llm_common.nlu import (
     build_alert_context,
     extract_producto,
     normalize_args,
+    normalize_producto,
     parse_confirmacion,
+    parse_escritura_rapida,
+    get_producto_nombres_from_candidates,
 )
 from llm_common.schemas import L1_TOOLS, L2_READ, L2_WRITE, L3_ARGS
 
@@ -90,8 +97,9 @@ class InferRequest(BaseModel):
     query: str
     tools: str
     session_id: str | None = None
-    mode: str = "full"  # "full" | "l1" | "l2" | "l3:<name>" | "confirm"
-    pending_alert: dict | None = None  # alerta Kalman activa en la sesion
+    mode: str = "full"
+    pending_alert: dict | None = None
+    bodega_id: int | None = None
 
 
 class ToolCall(BaseModel):
@@ -175,11 +183,11 @@ def _infer_raw(query: str, tools: list[dict]) -> tuple[list[ToolCall], str]:
     return _parse_tool_calls(raw), raw
 
 
-def _is_suspicious(query: str, result: list[ToolCall]) -> bool:
+def _is_suspicious(query: str, result: list[ToolCall], producto_nombres: set[str] | None = None) -> bool:
     if not result:
         return True
     tool_name = result[0].name
-    has_p = extract_producto(query) is not None
+    has_p = extract_producto(query, producto_nombres) is not None
     has_n = bool(re.search(r"(\d+)", query))
     if has_p and has_n and tool_name in ("investigar_sospechosos", "consultar_inventario"):
         return True
@@ -188,7 +196,7 @@ def _is_suspicious(query: str, result: list[ToolCall]) -> bool:
     return False
 
 
-def _pipeline(query: str, l1_options: list[dict], full_raw: list[str]) -> list[ToolCall] | None:
+def _pipeline(query: str, l1_options: list[dict], full_raw: list[str], producto_nombres: set[str] | None = None) -> list[ToolCall] | None:
     c1, r1 = _infer_raw(query, l1_options)
     full_raw.append(r1)
     if not c1:
@@ -211,7 +219,7 @@ def _pipeline(query: str, l1_options: list[dict], full_raw: list[str]) -> list[T
         c3, r3 = _infer_raw(query, [schema])
         full_raw.append(r3)
         if c3:
-            args = normalize_args(l2_choice, c3[0].arguments, query)
+            args = normalize_args(l2_choice, c3[0].arguments, query, producto_nombres)
             return [ToolCall(name=l2_choice, arguments=args)]
 
     return None
@@ -222,7 +230,7 @@ _READ_TOOLS = ("investigar_sospechosos", "consultar_inventario")
 _WRITE_TOOLS = ("agregar_inventario", "remover_inventario")
 
 
-def _confirmacion_fast_path(query: str, alert: dict) -> tuple[list[ToolCall], str]:
+def _confirmacion_fast_path(query: str, alert: dict, producto_nombres: set[str] | None = None) -> tuple[list[ToolCall], str]:
     """Resolucion de alerta pendiente. NUNCA cae al pipeline generico:
     el contexto de la alerta dispararia escrituras fantasma.
 
@@ -254,19 +262,38 @@ def _confirmacion_fast_path(query: str, alert: dict) -> tuple[list[ToolCall], st
     return [], " | ".join(raw)
 
 
-async def _run_inference(query: str) -> tuple[list[ToolCall], str]:
+def _regex_write_fast_path(query: str, producto_nombres: set[str]) -> ToolCall | None:
+    """Escritura determinista sin modelo ("añade 5 kilos de papa").
+
+    Solo dispara si el producto resuelve contra el catalogo; si no, se
+    deja que el pipeline del modelo lo intente.
+    """
+    fp = parse_escritura_rapida(query)
+    if not fp:
+        return None
+    prod = normalize_producto(fp["producto"], producto_nombres)
+    if not prod:
+        return None
+    return ToolCall(name=fp["tool"], arguments={
+        "producto": prod,
+        "cantidad": fp["cantidad"],
+        "unidad": fp["unidad"] or "",
+    })
+
+
+async def _run_inference(query: str, producto_nombres: set[str] | None = None) -> tuple[list[ToolCall], str]:
     """Ejecuta el pipeline L1/L2/L3 con un semaforo para limitar concurrencia."""
     assert _infer_sem is not None
     async with _infer_sem:
         full_raw: list[str] = []
         loop = asyncio.get_event_loop()
-        first = await loop.run_in_executor(None, _pipeline, query, L1_TOOLS, full_raw)
+        first = await loop.run_in_executor(None, _pipeline, query, L1_TOOLS.copy(), full_raw, producto_nombres)
 
-        if first and not _is_suspicious(query, first):
+        if first and not _is_suspicious(query, first, producto_nombres):
             return first, " | ".join(full_raw)
 
         #  Retry: si la eleccion L1/L2 no cuadra con la query, probamos alternativas
-        has_p = extract_producto(query) is not None
+        has_p = extract_producto(query, producto_nombres) is not None
         has_n = bool(re.search(r"(\d+)", query))
         needs_write = has_p and has_n
         needs_read = has_p and not has_n
@@ -308,13 +335,13 @@ async def _run_inference(query: str) -> tuple[list[ToolCall], str]:
                             c3, r3 = await loop.run_in_executor(None, _infer_raw, query, [schema])
                             full_raw.append(r3)
                             if c3:
-                                args = normalize_args(l2c, c3[0].arguments, query)
+                                args = normalize_args(l2c, c3[0].arguments, query, producto_nombres)
                                 return [ToolCall(name=l2c, arguments=args)], " | ".join(full_raw)
 
         #  Reintentar con la otra L1
         alt_l1 = [t for t in L1_TOOLS if t["name"] != failed_l1]
         full_raw.append("retry:L1")
-        result2 = await loop.run_in_executor(None, _pipeline, query, alt_l1, full_raw)
+        result2 = await loop.run_in_executor(None, _pipeline, query, alt_l1, full_raw, producto_nombres)
         if result2:
             return result2, " | ".join(full_raw)
 
@@ -341,11 +368,20 @@ async def infer(req: InferRequest):
     session_id = req.session_id or "default"
     t0 = time.time()
 
+    #  Catalogo SIEMPRE: de la bodega si viene, global si no. Sin catalogo
+    #  la normalizacion no resuelve ningun producto y toda escritura moria
+    #  en el enqueue con producto ''.
+    candidatos = await get_producto_nombres_bodega(req.bodega_id)
+    producto_nombres = get_producto_nombres_from_candidates(candidatos)
+
     if req.pending_alert:
-        #  Con alerta activa: solo confirmar/rechazar, jamas pipeline generico
-        calls, raw = _confirmacion_fast_path(req.query, req.pending_alert)
+        calls, raw = _confirmacion_fast_path(req.query, req.pending_alert, producto_nombres)
     else:
-        calls, raw = await _run_inference(req.query)
+        fp_call = _regex_write_fast_path(req.query, producto_nombres)
+        if fp_call is not None:
+            calls, raw = [fp_call], f"regex:{fp_call.name}"
+        else:
+            calls, raw = await _run_inference(req.query, producto_nombres)
 
     dt_ms = int((time.time() - t0) * 1000)
     logger.info("infer %dms session=%s calls=%s", dt_ms, session_id, [(c.name, c.arguments) for c in calls])
@@ -358,6 +394,7 @@ async def infer(req: InferRequest):
                     session_id=session_id,
                     tool_name=call.name,
                     arguments=call.arguments,
+                    bodega_id=req.bodega_id,
                 )
                 pending.append(PendingCall(pending_id=pid, tool_name=call.name, arguments=call.arguments))
                 logger.info("enqueued pending_id=%d tool=%s args=%s", pid, call.name, call.arguments)
