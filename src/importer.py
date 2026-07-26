@@ -69,7 +69,7 @@ def normalizar_unidad(raw: str) -> str:
 def importar(excel_path: str, dsn: str) -> dict[str, int]:
     wb = openpyxl.load_workbook(excel_path, data_only=True)
     conn = psycopg2.connect(dsn)
-    stats: dict[str, int] = {"bodegas": 0, "productos": 0, "errores": 0}
+    stats: dict[str, int] = {"bodegas": 0, "productos": 0, "errores": 0, "redondeos": 0}
 
     try:
         with conn.cursor() as cur:
@@ -173,6 +173,15 @@ def importar(excel_path: str, dsn: str) -> dict[str, int]:
                     if not nombre:
                         continue
 
+                    #  Productos con unidad "Unidad" son discretos (no existe
+                    #  "109.0065 unidades"): el Excel a veces trae ruido de
+                    #  punto flotante de formulas/redondeos previos. Sin esto,
+                    #  el trigger check_cantidad_unidad() de la DB rechaza el
+                    #  INSERT completo (execute_values aborta el batch entero).
+                    if unidad_nombre == "Unidad" and sd != round(sd):
+                        stats["redondeos"] += 1
+                        sd = float(round(sd))
+
                     unidad_id = unidad_id_map.get(unidad_nombre)
                     if unidad_id is None:
                         cur.execute(
@@ -239,7 +248,11 @@ def main():
 
     print(f"Importando catalogo desde: {args.excel}")
     stats = importar(args.excel, args.dsn)
-    print(f"\nResultado: {stats['bodegas']} bodegas, {stats['productos']} productos, {stats['errores']} errores")
+    print(
+        f"\nResultado: {stats['bodegas']} bodegas, {stats['productos']} productos, "
+        f"{stats['errores']} errores, {stats['redondeos']} valores redondeados "
+        f"(unidad 'Unidad' con decimales en el Excel)"
+    )
 
 
 if __name__ == "__main__":
