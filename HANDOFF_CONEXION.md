@@ -19,15 +19,22 @@ final nunca puede resolver `http://api-gateway:8200` porque es un hostname
 interno de Docker.
 
 Ahora el navegador **solo le habla al mismo origen** (`/api/...`, sin dominio).
-Next.js, corriendo server-side, reenvía esas llamadas al backend real. Esto se
-configura en [`frontend/next.config.js`](frontend/next.config.js):
+Next.js, corriendo server-side, reenvía esas llamadas al backend real.
 
-```js
-async rewrites() {
-  const target = process.env.API_GATEWAY_INTERNAL_URL || "http://localhost:8200";
-  return [{ source: "/api/:path*", destination: `${target}/api/:path*` }];
-}
-```
+**Actualización:** esto originalmente se hacía con `rewrites()` en
+`next.config.js`, pero se reemplazó por **Route Handlers** porque los
+rewrites de Next.js se resuelven en *build time* y no respetan variables de
+entorno leídas en runtime (rompía apenas el contenedor se levantaba con un
+`API_GATEWAY_INTERNAL_URL` distinto al del build). Ahora el proxy vive en:
+
+- [`frontend/lib/proxy-server.ts`](frontend/lib/proxy-server.ts) — helper
+  `proxyToGateway()` que lee `API_GATEWAY_INTERNAL_URL` en cada request.
+- [`frontend/app/api/[...path]/route.ts`](frontend/app/api/%5B...path%5D/route.ts) —
+  catch-all para todo `/api/*`.
+- [`frontend/app/query/route.ts`](frontend/app/query/route.ts),
+  [`frontend/app/inventory/route.ts`](frontend/app/inventory/route.ts),
+  [`frontend/app/sospechosos/route.ts`](frontend/app/sospechosos/route.ts) —
+  proxies puntuales para los endpoints que no viven bajo `/api/`.
 
 `API_GATEWAY_INTERNAL_URL` es una variable **de servidor** (sin prefijo
 `NEXT_PUBLIC_`), así que:
@@ -70,13 +77,26 @@ flowchart LR
 
 ### Opción A — con Docker Compose (recomendado, es como se despliega)
 
+**Ojo con los profiles.** `openrouter-service` y `elevenlabs-service` NO se
+levantan con un `docker compose up -d` a secas — están detrás de profiles
+(ver cabecera de [`docker-compose.yml`](docker-compose.yml)). Si tu `.env`
+tiene `LLM_BACKEND=openrouter` y/o `STT_BACKEND=elevenlabs` (la config actual
+del proyecto), hace falta:
+
+```bash
+docker compose --profile with-openrouter --profile with-elevenlabs up -d
+```
+
+Si en cambio tu `.env` usa los backends locales (`needle` + `whisper` +
+`kokoro`), alcanza con:
+
 ```bash
 docker compose up -d
 ```
 
-Esto ya levanta el frontend en `http://localhost:3000` con
+Esto levanta el frontend en `http://localhost:3000` con
 `API_GATEWAY_INTERNAL_URL=http://api-gateway:8200` (nombre del servicio dentro
-de la red de Docker). No hay que tocar nada.
+de la red de Docker). No hay que tocar nada más ahí.
 
 ### Opción B — frontend con `npm run dev` (hot reload) + backend en Docker
 
