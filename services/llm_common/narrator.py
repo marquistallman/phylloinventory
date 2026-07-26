@@ -165,7 +165,9 @@ def _cantidad_texto(cantidad: float, unidad: str) -> str:
 def _stock_texto(stock: float | None, unidad: str) -> str:
     if stock is None:
         return ""
-    s = _cantidad_texto(stock, unidad)
+    #  float(): stock_actual puede llegar como int desde JSON (el caller no
+    #  siempre lo castea), y .is_integer() no existe en int para py<3.12.
+    s = _cantidad_texto(float(stock), unidad)
     return f"te quedan {s}"
 
 
@@ -191,7 +193,12 @@ def _build_default(event: NarrateEvent, data: dict[str, Any]) -> str:
     unidad = data.get("unidad") or ""
     stock = data.get("stock_actual")
     bodega = data.get("bodega") or "la bodega"
-    tipo = data.get("tipo") or "entrada"
+    #  Sin default a "entrada": un registrar_conteo ("hay N") no tiene
+    #  tipo (no es una entrada ni una salida, es una medicion absoluta).
+    #  Si viene None/vacio, usamos una frase neutra ("contamos") en vez de
+    #  asumir que fue una entrada — asumir eso fue el bug original que
+    #  arranco todo este cambio (decia "sumamos 47" para un conteo de "hay 3").
+    tipo = data.get("tipo") or None
     puntaje = float(data.get("puntaje_riesgo") or 0)
 
     cant_txt = _cantidad_texto(float(cantidad), unidad)
@@ -201,7 +208,10 @@ def _build_default(event: NarrateEvent, data: dict[str, Any]) -> str:
         op = random.choice(_OPENINGS_ACK)
         if tipo == "salida":
             return f"{op} sacamos {cant_txt} de {producto}. {stock_txt.capitalize() if stock_txt else 'Listo'} en {bodega}."
-        return f"{op} sumamos {cant_txt} de {producto}. {stock_txt.capitalize() if stock_txt else 'Listo'} en {bodega}."
+        if tipo == "entrada":
+            return f"{op} sumamos {cant_txt} de {producto}. {stock_txt.capitalize() if stock_txt else 'Listo'} en {bodega}."
+        #  tipo=None -> registrar_conteo (conteo absoluto, no delta)
+        return f"{op} contamos {cant_txt} de {producto}. {stock_txt.capitalize() if stock_txt else 'Listo'} en {bodega}."
 
     if event == NarrateEvent.REGISTRAR_MANUAL:
         op = random.choice(_OPENINGS_ACK)
@@ -209,7 +219,14 @@ def _build_default(event: NarrateEvent, data: dict[str, Any]) -> str:
 
     if event == NarrateEvent.SOSPECHOSA:
         op = random.choice(_OPENINGS_ALERT)
-        accion = "ingreso" if tipo == "entrada" else "salida"
+        if tipo == "entrada":
+            accion = "ingreso"
+        elif tipo == "salida":
+            accion = "salida"
+        else:
+            #  tipo=None -> registrar_conteo: no es un movimiento, es un
+            #  conteo que no coincide con lo que el sistema esperaba.
+            accion = "conteo"
         riesgo_txt = _nivel_riesgo(puntaje)
         return (
             f"{op} {accion} de {cant_txt} de {producto} {riesgo_txt}, "
@@ -252,6 +269,15 @@ def _build_default(event: NarrateEvent, data: dict[str, Any]) -> str:
         cant = args.get("cantidad")
         if tool == "confirmar_movimiento":
             return "No entendi la confirmacion. Decime si o no."
+        if tool == "registrar_conteo":
+            if not prod:
+                return (
+                    "No se de que producto me estas contando. "
+                    "Probá con algo como 'hay cinco kilos de papa'."
+                )
+            if cant is None or float(cant) < 0:
+                return f"No entendi cuanto contaste de {prod}."
+            return f"No pude registrar el conteo de {prod}."
         if not prod:
             accion_txt = "agregar" if tool == "agregar_inventario" else "sacar"
             return (
@@ -265,7 +291,7 @@ def _build_default(event: NarrateEvent, data: dict[str, Any]) -> str:
 
     if event == NarrateEvent.NO_ACTION:
         op = random.choice(_OPENINGS_NOACTION)
-        return f"{op} Probá con 'agregar cinco kilos de papa', 'cuanto hay de tomate' o 'hay algo raro'."
+        return f"{op} Probá con 'agregar cinco kilos de papa', 'hay tres kilos de papa', 'cuanto hay de tomate' o 'hay algo raro'."
 
     return f"{producto} {cant_txt} en {bodega}."
 

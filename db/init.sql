@@ -472,6 +472,30 @@ BEGIN
         SET status = 'CONFIRMADA_MANUAL', resolved_at = NOW()
         WHERE id = p_pending_id;
 
+        --  Conteo absoluto: cualquier OTRO registrar_conteo del mismo
+        --  producto+bodega que siga esperando confirmacion quedo con un
+        --  baseline de stock viejo (se calculo contra el stock de ANTES
+        --  de que este se confirmara). Aplicarlo despues seria sumar/
+        --  restar un delta que ya no tiene sentido -> se invalida.
+        --  (ver db/migrations/003_conteo_absoluto.sql)
+        IF pend.tool_name = 'registrar_conteo' THEN
+            UPDATE pending_evaluations
+            SET status = 'RECHAZADA', decision = 'invalidado_por_conteo_mas_reciente', resolved_at = NOW()
+            WHERE tool_name = 'registrar_conteo'
+              AND producto_id = pend.producto_id AND bodega_id = pend.bodega_id
+              AND status IN ('PENDING', 'SOSPECHOSA')
+              AND id <> pend.id;
+
+            UPDATE registros_conteo
+            SET decision_kalman = 'RECHAZADA'
+            WHERE pending_id IN (
+                SELECT id FROM pending_evaluations
+                WHERE tool_name = 'registrar_conteo'
+                  AND producto_id = pend.producto_id AND bodega_id = pend.bodega_id
+                  AND status = 'RECHAZADA' AND decision = 'invalidado_por_conteo_mas_reciente'
+            );
+        END IF;
+
         RETURN 'Movimiento confirmado. Stock actualizado a ' || ns;
     ELSE
         UPDATE pending_evaluations

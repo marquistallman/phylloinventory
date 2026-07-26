@@ -13,6 +13,7 @@ L2_READ = [
 L2_WRITE = [
     {"name": "agregar_inventario", "description": "Add, put in, or increase product stock quantity.", "parameters": {}},
     {"name": "remover_inventario", "description": "Remove, take out, subtract, or decrease product stock quantity.", "parameters": {}},
+    {"name": "registrar_conteo", "description": "Report a physical count: state the ACTUAL total quantity present right now (e.g. 'there are 3 kilos'). NOT adding or removing, just reporting the current absolute total.", "parameters": {}},
 ]
 
 L3_ARGS = {
@@ -31,6 +32,15 @@ L3_ARGS = {
         "parameters": {
             "producto": {"type": "string", "description": "Product name.", "required": True},
             "cantidad": {"type": "number", "description": "Quantity to remove (can be decimal).", "required": True},
+            "unidad": {"type": "string", "description": "Unit mentioned by user.", "required": False},
+        },
+    },
+    "registrar_conteo": {
+        "name": "registrar_conteo",
+        "description": "Report the ACTUAL total quantity counted right now for a product (absolute count, e.g. 'hay 3 kilos de papa', 'tengo 10 unidades', 'quedan 5 cajas'). This is NOT a delta to add or subtract — it's what the person physically counted.",
+        "parameters": {
+            "producto": {"type": "string", "description": "Product name.", "required": True},
+            "cantidad": {"type": "number", "description": "The total quantity counted right now (absolute, not a delta). Can be 0.", "required": True},
             "unidad": {"type": "string", "description": "Unit mentioned by user.", "required": False},
         },
     },
@@ -81,6 +91,22 @@ TOOLS_OPENAI = [
                 "properties": {
                     "producto": {"type": "string", "description": "Nombre del producto"},
                     "cantidad": {"type": "number", "description": "Cantidad (puede ser decimal)"},
+                    "unidad": {"type": "string", "description": "Unidad mencionada por el usuario"},
+                },
+                "required": ["producto", "cantidad"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "registrar_conteo",
+            "description": "Registra un conteo FISICO absoluto: el usuario dice cuanto HAY en total ahora mismo (no es agregar ni quitar, es la cantidad total real). Usar para frases como 'hay 3 kilos de papa', 'tengo 10 unidades', 'quedan 5 cajas', 'contamos 8 bolsas'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "producto": {"type": "string", "description": "Nombre del producto"},
+                    "cantidad": {"type": "number", "description": "Cantidad TOTAL contada ahora mismo (absoluta, no un delta). Puede ser 0."},
                     "unidad": {"type": "string", "description": "Unidad mencionada por el usuario"},
                 },
                 "required": ["producto", "cantidad"],
