@@ -31,6 +31,7 @@ from llm_common.nlu import (
     normalize_args,
     normalize_producto,
     parse_confirmacion,
+    parse_conteo_absoluto_rapido,
     parse_escritura_rapida,
 )
 from llm_common.schemas import TOOLS_OPENAI
@@ -59,6 +60,15 @@ REGLAS OBLIGATORIAS (incumplir = error del sistema):
 
 3. NO inventes numeros: cantidad y unidad vienen de lo que dijo el usuario.
    Si dijo "5 kilos" -> cantidad=5, unidad="kg" (o "Kilogram").
+
+3.5. MUY IMPORTANTE — distingui "mover" de "contar":
+   - "agrega/mete/suma 5 kilos de papa", "saca/quita 3 kilos" -> el usuario
+     te dice un DELTA que hay que sumar o restar al stock actual. Usa
+     agregar_inventario / remover_inventario.
+   - "hay 5 kilos de papa", "tengo 10 unidades", "quedan 3 cajas", "contamos
+     8 bolsas" -> el usuario te dice el TOTAL real que hay ahora mismo (un
+     conteo fisico), NO un delta. Usa registrar_conteo con esa cantidad
+     absoluta, aunque sea muy distinta del stock que el sistema tenia.
 
 4. Despues de las tool_calls, podes agregar un content breve confirmando
    ("Listo", "Anotado", etc), pero las tools son lo importante.
@@ -200,10 +210,13 @@ async def infer(req: InferRequest):
         else:
             calls, raw = await _call_openrouter(build_alert_context(req.query, req.pending_alert))
     else:
-        fp = parse_escritura_rapida(req.query)
+        #  Conteo absoluto ("hay 3 papas") se prueba ANTES que
+        #  escritura ("agrega 3 papas"): no son lo mismo, ver
+        #  registrar_conteo vs agregar/remover_inventario.
+        fp = parse_conteo_absoluto_rapido(req.query) or parse_escritura_rapida(req.query)
         fp_prod = normalize_producto(fp["producto"], producto_nombres) if fp else ""
         if fp and fp_prod:
-            #  Escritura determinista: ni llamada a la API externa
+            #  Escritura/conteo determinista: ni llamada a la API externa
             calls = [ToolCall(name=fp["tool"], arguments={
                 "producto": fp_prod, "cantidad": fp["cantidad"], "unidad": fp["unidad"] or ""})]
             raw = f"regex:{fp['tool']}"
@@ -221,7 +234,7 @@ async def infer(req: InferRequest):
             args["pending_id"] = alert_pid  # el id real es el del estado, no del modelo
         normalized.append(ToolCall(name=call.name, arguments=args))
         try:
-            if call.name in ("agregar_inventario", "remover_inventario", "confirmar_movimiento"):
+            if call.name in ("agregar_inventario", "remover_inventario", "registrar_conteo", "confirmar_movimiento"):
                 pid = await enqueue_pending(
                     session_id=session_id,
                     tool_name=call.name,

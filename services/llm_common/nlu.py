@@ -129,6 +129,45 @@ _ESCRITURA_AGREGAR_RE = re.compile(_VERBOS_AGREGAR + r"\s+" + _TAIL, re.IGNORECA
 _ESCRITURA_REMOVER_RE = re.compile(_VERBOS_REMOVER + r"\s+" + _TAIL, re.IGNORECASE)
 
 
+# ---------------------------------------------------------------------------
+#  Fast path: conteo ABSOLUTO ("hay/tengo/quedan N de producto")
+#
+#  A diferencia de parse_escritura_rapida (agregar/remover = delta), esto
+#  es una medicion del estado: "hay 3 papas" significa que el total ahora
+#  es 3, no que se sumaron/restaron 3. Se resuelve como registrar_conteo,
+#  que en llm_common.db convierte esto a un delta contra el stock vigente
+#  y de ahi en mas usa el mismo motor de Kalman que agregar/remover.
+# ---------------------------------------------------------------------------
+
+_CONTEO_ABSOLUTO_RE = re.compile(
+    r"\b(?:hay|tengo|tenemos|queda[n]?|contamos|cont[eé])\s+"
+    r"(?P<cantidad>\d+(?:[\.,]\d+)?)\s*"
+    r"(?:(?P<unidad>kilos?|kilogramos?|kg|gramos?|gr?|litros?|lts?|ml"
+    r"|unidades?|un\.?|unds?|piezas?|pzs?|cajas?|paquetes?|sobres?|frascos?|rollos?)\s+)?"
+    r"(?:de\s+)?(?P<producto>.+?)\s*[.,;!?]?$",
+    re.IGNORECASE,
+)
+
+
+def parse_conteo_absoluto_rapido(texto: str) -> dict | None:
+    """Fast path determinista para conteos absolutos: "hay/tengo/quedan N
+    [unidad] [de] producto". Se dispara ANTES de parse_escritura_rapida
+    para que "hay 3 papas" no termine confundido con un movimiento.
+
+    Retorna {"tool": "registrar_conteo", "cantidad": float,
+             "unidad": str|None, "producto": str} o None si no matchea.
+    """
+    m = _CONTEO_ABSOLUTO_RE.search(texto.strip())
+    if not m:
+        return None
+    return {
+        "tool": "registrar_conteo",
+        "cantidad": float(m.group("cantidad").replace(",", ".")),
+        "unidad": _normalizar_unidad_raw((m.group("unidad") or "").lower()) or None,
+        "producto": m.group("producto").strip(),
+    }
+
+
 def parse_escritura_rapida(texto: str) -> dict | None:
     """Fast path determinista para escrituras: <verbo> <num> [unidad] [de] <producto>.
 
@@ -342,6 +381,36 @@ def normalize_args(name: str, args: dict, query: str, producto_nombres: set[str]
         if not prod:
             prod = extract_producto(query, producto_nombres) or ""
         if not cant:
+            nums = re.findall(r"(\d+(?:[\.,]\d+)?)", query)
+            cant = float(nums[-1].replace(",", ".")) if nums else 0.0
+
+        unidad = args.get("unidad")
+        if not unidad:
+            unidad = extract_unidad(query)
+
+        return {
+            "producto": prod,
+            "cantidad": cant,
+            "unidad": unidad or "",
+        }
+
+    if name == "registrar_conteo":
+        prod = normalize_producto(str(args.get("producto", "")), producto_nombres)
+        cant = args.get("cantidad")
+        if isinstance(cant, str):
+            m = re.search(r"(\d+(?:[\.,]\d+)?)", cant.replace(",", "."))
+            cant = float(m.group(1)) if m else 0.0
+        elif isinstance(cant, (int, float)) and not isinstance(cant, bool):
+            cant = float(cant)
+        else:
+            cant = 0.0
+
+        if not prod:
+            prod = extract_producto(query, producto_nombres) or ""
+        #  A diferencia de agregar/remover, 0 es un valor VALIDO ("hay 0
+        #  papas" = no queda nada). Solo re-extraemos de la query si el
+        #  parseo no encontro ningun numero en absoluto.
+        if cant == 0.0 and not re.search(r"\b0\b", query):
             nums = re.findall(r"(\d+(?:[\.,]\d+)?)", query)
             cant = float(nums[-1].replace(",", ".")) if nums else 0.0
 

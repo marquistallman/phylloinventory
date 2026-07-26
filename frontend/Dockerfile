@@ -16,10 +16,11 @@ WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 
-# Variables de entorno públicas para el build
-ARG NEXT_PUBLIC_API_GATEWAY_URL
+# Variables de entorno públicas para el build.
+# NEXT_PUBLIC_API_GATEWAY_URL ya NO hace falta: las llamadas del navegador
+# son relativas (/api/...) y las resuelve el rewrite de next.config.js
+# via API_GATEWAY_INTERNAL_URL (var de servidor, se setea en runtime).
 ARG NEXT_PUBLIC_API_KEY
-ENV NEXT_PUBLIC_API_GATEWAY_URL=${NEXT_PUBLIC_API_GATEWAY_URL}
 ENV NEXT_PUBLIC_API_KEY=${NEXT_PUBLIC_API_KEY}
 
 RUN npm run build

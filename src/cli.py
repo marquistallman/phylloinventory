@@ -220,6 +220,16 @@ def _narrate_fallback(event: str, data: dict) -> str:
     return f"Evento: {event}."
 
 
+def _tipo_narrado(tool_name: str | None) -> str | None:
+    """entrada/salida para movimientos; None (neutro) para registrar_conteo,
+    que no es un movimiento sino un conteo absoluto ("hay N")."""
+    if tool_name == "agregar_inventario":
+        return "entrada"
+    if tool_name == "remover_inventario":
+        return "salida"
+    return None
+
+
 def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> None:
     if isinstance(inv, dict) and "stock_actual" in inv:
         stock = inv["stock_actual"]
@@ -237,7 +247,7 @@ def _narrate_aceptada(tool_name: str, args: dict, inv: dict | list | None) -> No
         "unidad": args.get("unidad") or "",
         "stock_actual": stock,
         "bodega": bodega,
-        "tipo": "entrada" if tool_name == "agregar_inventario" else "salida",
+        "tipo": _tipo_narrado(tool_name),
     })
 
 
@@ -248,7 +258,7 @@ def _narrate_sospechosa(args: dict, puntaje: float, residual: float) -> None:
         "cantidad": args.get("cantidad"),
         "unidad": args.get("unidad") or "",
         "puntaje_riesgo": puntaje,
-        "tipo": "entrada" if args.get("tool_name") == "agregar_inventario" else "salida",
+        "tipo": _tipo_narrado(args.get("tool_name")),
     })
 
 
@@ -409,7 +419,7 @@ async def handle_query(state: SessionState, text: str) -> None:
         else:
             console.print(
                 "[yellow]No detecte ninguna accion. Prueba:[/yellow] "
-                "'agrega 4 papas' / 'cuanto hay de tomate' / 'hay algo raro'"
+                "'agrega 4 papas' / 'hay 4 papas' / 'cuanto hay de tomate' / 'hay algo raro'"
             )
             _narrate_no_action()
         return
@@ -427,13 +437,13 @@ async def handle_query(state: SessionState, text: str) -> None:
     enqueued = {p["tool_name"] for p in pending if p.get("pending_id")}
     for call in tool_calls:
         n = call.get("name")
-        if n in ("agregar_inventario", "remover_inventario", "confirmar_movimiento") and n not in enqueued:
+        if n in ("agregar_inventario", "remover_inventario", "registrar_conteo", "confirmar_movimiento") and n not in enqueued:
             console.print(
                 f"  [yellow]i '{n}' no se encolo — revisa producto/cantidad "
                 f"(validos: papa, cebolla, tomate, zanahoria, ajo)[/yellow]"
             )
             _narrate_invalid(n, call.get("arguments") or {})
-    write_actions = [p for p in pending if p["tool_name"] in ("agregar_inventario", "remover_inventario")]
+    write_actions = [p for p in pending if p["tool_name"] in ("agregar_inventario", "remover_inventario", "registrar_conteo")]
     confirm_actions = [p for p in pending if p["tool_name"] == "confirmar_movimiento"]
     read_actions = [p for p in pending if p["tool_name"] in ("consultar_inventario", "investigar_sospechosos")]
 
@@ -531,7 +541,7 @@ async def _render_pending(state: SessionState, p: dict, row: dict) -> None:
             "pending_id": pid,
             "producto": args.get("producto"),
             "cantidad": args.get("cantidad"),
-            "tipo": "entrada" if name == "agregar_inventario" else "salida",
+            "tipo": _tipo_narrado(name),
             "residual": residual,
             "puntaje_riesgo": puntaje,
         }

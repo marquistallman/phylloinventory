@@ -31,6 +31,7 @@ from llm_common.nlu import (
     normalize_args,
     normalize_producto,
     parse_confirmacion,
+    parse_conteo_absoluto_rapido,
     parse_escritura_rapida,
     get_producto_nombres_from_candidates,
 )
@@ -191,7 +192,7 @@ def _is_suspicious(query: str, result: list[ToolCall], producto_nombres: set[str
     has_n = bool(re.search(r"(\d+)", query))
     if has_p and has_n and tool_name in ("investigar_sospechosos", "consultar_inventario"):
         return True
-    if has_p and not has_n and tool_name in ("agregar_inventario", "remover_inventario"):
+    if has_p and not has_n and tool_name in ("agregar_inventario", "remover_inventario", "registrar_conteo"):
         return True
     return False
 
@@ -227,7 +228,7 @@ def _pipeline(query: str, l1_options: list[dict], full_raw: list[str], producto_
 
 _L2_BY_L1 = {"leer_inventario": L2_READ, "modificar_inventario": L2_WRITE}
 _READ_TOOLS = ("investigar_sospechosos", "consultar_inventario")
-_WRITE_TOOLS = ("agregar_inventario", "remover_inventario")
+_WRITE_TOOLS = ("agregar_inventario", "remover_inventario", "registrar_conteo")
 
 
 def _confirmacion_fast_path(query: str, alert: dict, producto_nombres: set[str] | None = None) -> tuple[list[ToolCall], str]:
@@ -269,6 +270,26 @@ def _regex_write_fast_path(query: str, producto_nombres: set[str]) -> ToolCall |
     deja que el pipeline del modelo lo intente.
     """
     fp = parse_escritura_rapida(query)
+    if not fp:
+        return None
+    prod = normalize_producto(fp["producto"], producto_nombres)
+    if not prod:
+        return None
+    return ToolCall(name=fp["tool"], arguments={
+        "producto": prod,
+        "cantidad": fp["cantidad"],
+        "unidad": fp["unidad"] or "",
+    })
+
+
+def _regex_conteo_fast_path(query: str, producto_nombres: set[str]) -> ToolCall | None:
+    """Conteo ABSOLUTO determinista sin modelo ("hay 3 kilos de papa").
+
+    Se prueba ANTES que _regex_write_fast_path: "hay 3 papas" no es un
+    delta a sumar, es el total real ahora mismo. Mismo criterio: solo
+    dispara si el producto resuelve contra el catalogo.
+    """
+    fp = parse_conteo_absoluto_rapido(query)
     if not fp:
         return None
     prod = normalize_producto(fp["producto"], producto_nombres)
@@ -377,7 +398,7 @@ async def infer(req: InferRequest):
     if req.pending_alert:
         calls, raw = _confirmacion_fast_path(req.query, req.pending_alert, producto_nombres)
     else:
-        fp_call = _regex_write_fast_path(req.query, producto_nombres)
+        fp_call = _regex_conteo_fast_path(req.query, producto_nombres) or _regex_write_fast_path(req.query, producto_nombres)
         if fp_call is not None:
             calls, raw = [fp_call], f"regex:{fp_call.name}"
         else:
@@ -389,7 +410,7 @@ async def infer(req: InferRequest):
     pending: list[PendingCall] = []
     for call in calls:
         try:
-            if call.name in ("agregar_inventario", "remover_inventario", "confirmar_movimiento"):
+            if call.name in ("agregar_inventario", "remover_inventario", "registrar_conteo", "confirmar_movimiento"):
                 pid = await enqueue_pending(
                     session_id=session_id,
                     tool_name=call.name,

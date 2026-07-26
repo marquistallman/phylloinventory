@@ -52,12 +52,16 @@ export default function BuscarPage() {
       .catch((e) => console.error("Error cargando sesión:", e));
   }, [sesionId]);
 
-  // Cargar catálogo con debounce
+  // Cargar catálogo con debounce. El filtro por estado (pendientes/
+  // contados/alertas) NO se manda al backend: se aplica client-side sobre
+  // el catalogo completo (ver `productosFiltrados`), porque el backend
+  // sólo entiende `solo_pendientes` y antes los chips "Contados"/"Alertas"
+  // no filtraban nada (re-pedían la misma lista completa).
   useEffect(() => {
     if (!sesion) return;
     const t = setTimeout(() => loadProductos(), 300);
     return () => clearTimeout(t);
-  }, [search, filtro, sesion?.bodega_id]);
+  }, [search, sesion?.bodega_id]);
 
   async function loadProductos() {
     if (!sesion) return;
@@ -65,7 +69,6 @@ export default function BuscarPage() {
     try {
       const qs = new URLSearchParams({ sesion_id: String(sesionId) });
       if (search.trim()) qs.set("q", search.trim());
-      if (filtro === "pendientes") qs.set("solo_pendientes", "true");
       const data = await api<Producto[]>(
         `/api/catalogo/bodega/${sesion.bodega_id}?${qs.toString()}`
       );
@@ -76,6 +79,14 @@ export default function BuscarPage() {
       setLoading(false);
     }
   }
+
+  const FILTRO_A_ESTADO: Record<Exclude<Filtro, "todos">, Producto["estado_conteo"]> = {
+    pendientes: "pendiente",
+    contados: "contado",
+    alertas: "alerta",
+  };
+  const productosFiltrados =
+    filtro === "todos" ? productos : productos.filter((p) => p.estado_conteo === FILTRO_A_ESTADO[filtro]);
 
   // ── Render ────────────────────────────────────────────────────────────
   return (
@@ -146,11 +157,11 @@ export default function BuscarPage() {
         <p className="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">
           {loading
             ? "Buscando..."
-            : `${productos.length} resultado${productos.length === 1 ? "" : "s"}`}
+            : `${productosFiltrados.length} resultado${productosFiltrados.length === 1 ? "" : "s"}`}
         </p>
 
         {/* Lista de productos */}
-        {productos.length === 0 && !loading ? (
+        {productosFiltrados.length === 0 && !loading ? (
           <div className="text-center py-12 text-gray-500">
             {search
               ? `Sin resultados para "${search}"`
@@ -158,7 +169,7 @@ export default function BuscarPage() {
           </div>
         ) : (
           <div className="space-y-2">
-            {productos.map((p) => (
+            {productosFiltrados.map((p) => (
               <ProductoCard
                 key={p.id}
                 producto={p}

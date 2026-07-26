@@ -21,6 +21,7 @@ interface SesionEstado {
 }
 
 interface Sospechoso {
+  pending_id: number;
   nombre: string;
   unidad: string;
   cantidad_contada: number;
@@ -97,20 +98,59 @@ export default function ReportePage() {
 
   async function handleAccionAlerta(idx: number, accion: AccionAlerta) {
     if (!accion) return;
+    const s = sospechosos[idx];
+    if (!s) return;
     setProcesando({ idx, accion });
     try {
-      // TODO: cuando el backend exponga endpoint directo de confirmar/rechazar
-      // por id de pendiente, reemplazar acá. Por ahora, simulamos con delay y
-      // refresco, asumiendo que el worker ya procesó la decisión.
-      await new Promise((r) => setTimeout(r, 400));
-      // Optimistic update: lo saco de la lista
+      //  Igual mecanismo que la CLI para resolver una alerta SOSPECHOSA:
+      //  no hay un endpoint dedicado /api/pending/{id}/confirmar — se
+      //  reusa /query con texto "si"/"no" + pending_alert (needle/openrouter
+      //  ya saben resolver esto via confirmar_movimiento).
+      const confirmar = accion === "confirmar";
+      const puntaje = s.umbral ? Math.abs(s.residual) / s.umbral : 0;
+      const resp = await api<{ pending: Array<{ pending_id: number; tool_name: string }> }>(
+        "/query",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            text: confirmar ? "si" : "no",
+            session_id: String(sesionId),
+            bodega_id: estado?.bodega_id,
+            pending_alert: {
+              pending_id: s.pending_id,
+              producto: s.nombre,
+              cantidad: s.cantidad_contada,
+              tipo: null,
+              residual: s.residual,
+              puntaje_riesgo: puntaje,
+            },
+          }),
+        }
+      );
+
+      const confirmPending = resp.pending?.find((p) => p.tool_name === "confirmar_movimiento");
+      if (!confirmPending) {
+        throw new Error("No se pudo procesar la confirmación.");
+      }
+      await pollPendingConfirmacion(confirmPending.pending_id);
+
       setSospechosos((prev) => prev.filter((_, i) => i !== idx));
-      // Refrescar para que las stats se actualicen
       loadAll();
-    } catch (e) {
+    } catch (e: any) {
       console.error("Error procesando alerta:", e);
+      setError(e?.message || "No se pudo procesar la alerta. Reintentá.");
     } finally {
       setProcesando({ idx: -1, accion: null });
+    }
+  }
+
+  async function pollPendingConfirmacion(id: number): Promise<{ status: string }> {
+    const start = Date.now();
+    while (true) {
+      const data = await api<{ status: string }>(`/api/pending/${id}`);
+      if (data.status !== "PENDING") return data;
+      if (Date.now() - start > 15000) throw new Error("Timeout esperando confirmación");
+      await new Promise((r) => setTimeout(r, 200));
     }
   }
 

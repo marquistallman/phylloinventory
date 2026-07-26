@@ -291,7 +291,7 @@ func (wp *WorkerPool) processOne(workerID int) (bool, error) {
 	//  Procesar segun tool_name (todo dentro de tx)
 	var procErr error
 	switch p.ToolName {
-	case "agregar_inventario", "remover_inventario":
+	case "agregar_inventario", "remover_inventario", "registrar_conteo":
 		procErr = wp.evalMovimiento(tx, p)
 	case "confirmar_movimiento":
 		procErr = wp.evalConfirmacion(tx, p)
@@ -324,7 +324,40 @@ func (wp *WorkerPool) processOne(workerID int) (bool, error) {
 
 // evalMovimiento: llama kalman_evaluar(). Si PASA, aplica. Si FALLA, marca sospechosa.
 // Todo dentro de tx: el row-lock de la fila pending se mantiene hasta el commit.
+//
+// Tambien maneja registrar_conteo (conteo absoluto "hay N"): en
+// llm_common.db ya se convirtio a un delta (tipo/cantidad) contra el
+// stock vigente en el momento del conteo, asi que de aca en mas es
+// EXACTAMENTE el mismo camino que agregar/remover_inventario — salvo dos
+// detalles propios de un conteo:
+//  1. cantidad=0 (conto justo lo que ya habia) no puede pasar por
+//     aplicar_movimiento_aceptado porque violaria el
+//     CHECK(cantidad_reportada > 0) de inventario_movimientos.
+//  2. si esto se acepta, cualquier OTRO registrar_conteo pendiente del
+//     mismo producto+bodega quedo con un baseline stale (dos conteos no
+//     se componen sumando como dos movimientos reales) y hay que invalidarlo.
 func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
+	if p.ToolName == "registrar_conteo" && p.Cantidad == 0 {
+		_, err := tx.Exec(wp.ctx, `
+			UPDATE pending_evaluations
+			SET status='ACEPTADA', decision='sin_cambios', residual=0, umbral=0, resolved_at=NOW()
+			WHERE id=$1
+		`, p.ID)
+		if err != nil {
+			return err
+		}
+		_, _ = tx.Exec(wp.ctx, `
+			UPDATE registros_conteo SET decision_kalman='ACEPTADA'
+			WHERE pending_id=$1
+		`, p.ID)
+		if err := wp.invalidarConteosDuplicados(tx, p); err != nil {
+			return err
+		}
+		wp.incStat(&wp.accepted)
+		log.Printf("[pending %d] registrar_conteo sin cambios (coincide con stock actual)", p.ID)
+		return nil
+	}
+
 	var k KalmanResult
 	err := tx.QueryRow(wp.ctx, `
 		SELECT decision, residual, umbral, media_actual, varianza_actual, stock_proyectado, puntaje_riesgo
@@ -375,6 +408,12 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 		wp.incStat(&wp.accepted)
 		log.Printf("[pending %d] ACEPTADA movimiento_id=%d", p.ID, movID)
 
+		if p.ToolName == "registrar_conteo" {
+			if err := wp.invalidarConteosDuplicados(tx, p); err != nil {
+				return err
+			}
+		}
+
 	case "FALLA":
 		_, err := tx.Exec(wp.ctx, `
 			UPDATE pending_evaluations
@@ -405,6 +444,49 @@ func (wp *WorkerPool) evalMovimiento(tx pgx.Tx, p Pending) error {
 		return fmt.Errorf("unknown kalman decision: %s", k.Decision)
 	}
 
+	return nil
+}
+
+// invalidarConteosDuplicados: cuando un registrar_conteo se resuelve
+// (ACEPTADA aca, o CONFIRMADA_MANUAL via confirmar_movimiento() en SQL),
+// cualquier OTRO registrar_conteo que siga PENDING/SOSPECHOSA para el
+// mismo producto+bodega quedo con un baseline de stock viejo. Aplicarlo
+// mas tarde seria sumar/restar un delta que ya no representa nada real
+// (dos personas contando lo mismo no son dos movimientos que se sumen) —
+// se descarta en vez de dejarlo pisar el conteo que ya se resolvio.
+func (wp *WorkerPool) invalidarConteosDuplicados(tx pgx.Tx, p Pending) error {
+	rows, err := tx.Query(wp.ctx, `
+		UPDATE pending_evaluations
+		SET status='RECHAZADA', decision='invalidado_por_conteo_mas_reciente', resolved_at=NOW()
+		WHERE tool_name='registrar_conteo'
+		  AND producto_id=$1 AND bodega_id=$2
+		  AND status IN ('PENDING','SOSPECHOSA')
+		  AND id <> $3
+		RETURNING id
+	`, p.ProductoID, p.BodegaID, p.ID)
+	if err != nil {
+		return err
+	}
+	var invalidados []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err == nil {
+			invalidados = append(invalidados, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(invalidados) == 0 {
+		return nil
+	}
+	_, _ = tx.Exec(wp.ctx, `
+		UPDATE registros_conteo SET decision_kalman='RECHAZADA'
+		WHERE pending_id = ANY($1)
+	`, invalidados)
+	log.Printf("[pending %d] invalido %d registrar_conteo duplicado(s) para producto=%d bodega=%d",
+		p.ID, len(invalidados), p.ProductoID, p.BodegaID)
 	return nil
 }
 

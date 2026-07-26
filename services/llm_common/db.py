@@ -212,6 +212,11 @@ async def enqueue_pending(
     tipo: str | None = None
     cantidad: float | None = None
     resolved_bodega_id: int | None = None
+    #  Para registrar_conteo, `cantidad` (arriba) termina siendo el DELTA
+    #  interno para el motor de Kalman (ver mas abajo). cantidad_contada
+    #  guarda el numero ABSOLUTO que dijo el usuario ("hay 3 papas" -> 3),
+    #  que es lo que tiene que mostrarle el Narrador, no el delta.
+    cantidad_contada: float | None = None
 
     if tool_name in ("agregar_inventario", "remover_inventario"):
         prod_nombre = arguments.get("producto", "")
@@ -247,6 +252,51 @@ async def enqueue_pending(
         arguments["unidad"] = unidad_catalogo
         arguments["cantidad_normalizada"] = cantidad_normalizada
         arguments["_cantidad_original"] = cant
+        arguments["_unidad_original"] = unidad_usuario or unidad_catalogo
+        cantidad_contada = cantidad_normalizada
+
+    elif tool_name == "registrar_conteo":
+        #  Conteo ABSOLUTO ("hay 3 papas"), no un delta. Se convierte a un
+        #  delta contra el stock vigente AHORA (t0) y de ahi en mas viaja
+        #  por el mismo circuito que agregar/remover_inventario: mismo
+        #  kalman_evaluar/aplicar_movimiento_aceptado/confirmar_movimiento,
+        #  sin tocarlos (ver charla del proyecto sobre por que esto es
+        #  matematicamente equivalente y ademas respeta movimientos
+        #  legitimos que puedan pasar mientras un conteo sospechoso espera
+        #  confirmacion humana).
+        prod_nombre = arguments.get("producto", "")
+        cant_contada = float(arguments.get("cantidad", 0))
+        unidad_usuario = arguments.get("unidad", "") or None
+
+        prod = None
+        if prod_nombre and bodega_id:
+            prod = await find_producto_fuzzy(prod_nombre, bodega_id)
+        if prod is None and prod_nombre:
+            prod = await find_producto(prod_nombre)
+
+        if prod is None:
+            raise ValueError(f"Producto '{prod_nombre}' no encontrado")
+
+        producto_id = prod["id"]
+        resolved_bodega_id = prod.get("bodega_id") or bodega_id
+
+        unidad_catalogo = prod.get("unidad", "Unidad")
+        cantidad_normalizada, _ = nlu.normalize_unidad(cant_contada, unidad_usuario, unidad_catalogo)
+
+        if cantidad_normalizada < 0:
+            raise ValueError("la cantidad contada no puede ser negativa")
+
+        stock_actual = float(prod.get("stock_actual") or 0)
+        delta = cantidad_normalizada - stock_actual
+        tipo = "entrada" if delta >= 0 else "salida"
+        cantidad = abs(delta)
+        cantidad_contada = cantidad_normalizada
+
+        arguments["cantidad"] = cantidad_normalizada
+        arguments["unidad"] = unidad_catalogo
+        arguments["cantidad_contada"] = cantidad_normalizada
+        arguments["_delta"] = delta
+        arguments["_cantidad_original"] = cant_contada
         arguments["_unidad_original"] = unidad_usuario or unidad_catalogo
 
     elif tool_name == "confirmar_movimiento":
@@ -286,6 +336,10 @@ async def enqueue_pending(
             producto_id, resolved_bodega_id,
         )
         stock_sistema = float(prod["stock_actual"]) if prod else 0.0
+        #  cantidad_contada: para registrar_conteo es el numero ABSOLUTO que
+        #  dijo el usuario (no el delta que viaja en `cantidad`/pending.cantidad
+        #  para el motor de Kalman). Para agregar/remover coincide con `cantidad`.
+        cc = cantidad_contada if cantidad_contada is not None else cantidad
         await execute(
             """
             INSERT INTO registros_conteo
@@ -296,9 +350,9 @@ async def enqueue_pending(
             int(session_id),
             producto_id,
             resolved_bodega_id,
-            cantidad,
+            cc,
             arguments.get("unidad_usada", arguments.get("unidad", "Unidad")),
-            cantidad,
+            cc,
             stock_sistema,
             pending_id,
         )
@@ -313,10 +367,19 @@ async def enqueue_registro_manual(
     cantidad: float,
     unidad: str,
 ) -> int:
-    """Encola un registro manual (modo Tablet) a pending_evaluations.
+    """Encola un registro de CONTEO ABSOLUTO (modo Tablet/Voz en sesion de conteo).
+
+    `cantidad` es lo que se conto FISICAMENTE ("hay N"), no un delta a
+    sumar. Una sesion de conteo es, por definicion, siempre un conteo
+    absoluto — nunca "agregue N" — asi que esto SIEMPRE se encola como
+    registrar_conteo: se calcula el delta contra el stock_actual vigente
+    ahora mismo y de ahi en mas usa el mismo circuito que
+    agregar/remover_inventario (kalman_evaluar / aplicar_movimiento_aceptado
+    / confirmar_movimiento, sin tocarlos).
 
     No pasa por LLM — va directo a la cola con producto_id ya resuelto.
-    Tambien crea el registro en registros_conteo.
+    Tambien crea el registro en registros_conteo (con la cantidad CONTADA,
+    no el delta, para que el Narrador diga "contamos N" y no "sumamos N-stock").
     """
     prod = await fetchrow(
         """SELECT id, nombre, unidad, stock_actual, bodega_id
@@ -333,28 +396,36 @@ async def enqueue_registro_manual(
     unidad_catalogo = prod["unidad"]
     cantidad_normalizada, unidad_final = nlu.normalize_unidad(cantidad, unidad, unidad_catalogo)
 
-    if cantidad_normalizada <= 0:
-        raise ValueError("cantidad debe ser > 0")
+    if cantidad_normalizada < 0:
+        raise ValueError("la cantidad contada no puede ser negativa")
+
+    stock_actual = float(prod["stock_actual"])
+    delta = cantidad_normalizada - stock_actual
+    tipo = "entrada" if delta >= 0 else "salida"
+    cantidad_delta = abs(delta)
 
     arguments = {
         "producto": prod["nombre"],
         "producto_id": producto_id,
         "cantidad": cantidad_normalizada,
+        "cantidad_contada": cantidad_normalizada,
         "unidad": unidad_final,
         "unidad_usada": unidad,
+        "_delta": delta,
     }
 
     row = await fetchrow(
         """
         INSERT INTO pending_evaluations
             (session_id, tool_name, producto_id, bodega_id, tipo, cantidad, payload)
-        VALUES ($1, 'agregar_inventario', $2, $3, 'entrada', $4, $5::jsonb)
+        VALUES ($1, 'registrar_conteo', $2, $3, $4, $5, $6::jsonb)
         RETURNING id
         """,
         session_id,
         producto_id,
         bodega_id,
-        cantidad_normalizada,
+        tipo,
+        cantidad_delta,
         json.dumps(arguments),
     )
     if row is None:
@@ -375,7 +446,7 @@ async def enqueue_registro_manual(
         cantidad,
         unidad,
         cantidad_normalizada,
-        float(prod["stock_actual"]),
+        stock_actual,
         pending_id,
     )
 

@@ -142,10 +142,12 @@ frontend/
 
 | Variable | Default | Descripción |
 |----------|---------|-------------|
-| `NEXT_PUBLIC_API_GATEWAY_URL` | `http://localhost:8200` | URL del api-gateway de Phylloinventory |
+| `API_GATEWAY_INTERNAL_URL` | `http://localhost:8200` | URL interna del api-gateway. Var de **servidor** (sin `NEXT_PUBLIC_`), usada solo por el rewrite de `next.config.js`. Nunca llega al navegador. |
 | `NEXT_PUBLIC_API_KEY` | (vacío) | API key para `X-API-Key` header. Vacío = sin auth |
 
-> **⚠️ Producción**: si el frontend es un SPA público, **NO expongas la API_KEY en el bundle**. Usá un BFF (Next.js API routes, Nuxt server routes) o autenticación por cookies.
+> El navegador ya NO le pega directo al api-gateway: todas las llamadas van a rutas relativas (`/api/...`) del mismo origen, y Next.js las reenvía server-side vía `API_GATEWAY_INTERNAL_URL`. Ver la sección 10 y el documento [`../HANDOFF_CONEXION.md`](../HANDOFF_CONEXION.md) para el detalle de por qué se hizo así (deploy detrás de Cloudflare en un solo dominio).
+>
+> **⚠️ `NEXT_PUBLIC_API_KEY` sigue viajando en el bundle del navegador** (limitación conocida). Si se necesita ocultarla del todo, hay que migrar a un BFF real con Route Handlers de Next.js en vez del rewrite simple actual.
 
 ---
 
@@ -315,7 +317,7 @@ Definidas en `app/globals.css`:
 - Empty state con CTA
 
 **Endpoints (requeridos)**:
-- `GET /api/sesiones` — **NO EXISTE en el backend, hay que agregarlo**
+- `GET /api/sesiones`
 
 ---
 
@@ -366,10 +368,13 @@ Iconos disponibles:
 
 ## 8. Cliente API
 
-`lib/api.ts`:
+`lib/api.ts` (ver el archivo real para la versión completa):
 
 ```ts
-const BASE = process.env.NEXT_PUBLIC_API_GATEWAY_URL || "http://localhost:8200";
+// BASE relativo por default: la llamada queda en el mismo origen
+// (localhost:3000 en dev, o el dominio publico en prod) y la resuelve
+// el rewrite de next.config.js hacia API_GATEWAY_INTERNAL_URL.
+const BASE = process.env.NEXT_PUBLIC_API_GATEWAY_URL || "";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 export class ApiError extends Error {
@@ -448,7 +453,7 @@ const res = await fetch(`${GATEWAY}/api/audio/transcribir`, {
 | POST | `/api/sesion/iniciar` | Home |
 | POST | `/api/sesion/finalizar` | Manual, Reporte |
 | GET | `/api/sesion/{id}/estado` | Manual, Buscar, Reporte, Sesiones |
-| **GET** | **`/api/sesiones`** | **Sesiones (NO EXISTE — agregar al backend)** |
+| GET | `/api/sesiones` | Sesiones |
 
 ### Conteo (dentro de una sesión)
 
@@ -489,63 +494,17 @@ const res = await fetch(`${GATEWAY}/api/audio/transcribir`, {
 
 ## 10. Conectar con el backend
 
-### Asumimos que el backend ya tiene CORS abierto
+> **Detalle completo (por qué se hizo así, cómo levantarlo en local y detrás de Cloudflare)**: ver [`../HANDOFF_CONEXION.md`](../HANDOFF_CONEXION.md). Esta sección queda como resumen rápido.
 
-El api-gateway de Phylloininventory ya viene con `CORSMiddleware` configurado y `ALLOWED_ORIGINS` en el `.env`. Para dev con el frontend en `http://localhost:3000`, asegurate que el `.env` del backend tenga:
+El navegador ya no le habla directo al api-gateway. `next.config.js` tiene un `rewrite` que reenvía `/api/*` (server-side) hacia `API_GATEWAY_INTERNAL_URL`. Por eso:
 
-```bash
-ALLOWED_ORIGINS=*
-```
+- No hace falta abrir CORS para el flujo normal del navegador (todo es same-origin).
+- `ALLOWED_ORIGINS` en el backend queda como defensa extra, no como requisito.
+- Cambiar dónde vive el backend real es solo cambiar `API_GATEWAY_INTERNAL_URL`, sin rebuildear el frontend.
 
-(o específicamente `http://localhost:3000`)
+`GET /api/sesiones` ya está implementado en `services/api-gateway/main.py` (sección "Sesiones de conteo").
 
-### Endpoints que faltan agregar al backend
-
-#### 1. `GET /api/sesiones` (CRÍTICO para la página de Historial)
-
-Editá `services/api-gateway/main.py`:
-
-```python
-@app.get("/api/sesiones")
-async def list_sesiones():
-    """Lista todas las sesiones de conteo, ordenadas por fecha."""
-    async with db_pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT 
-                s.id, s.bodega_id, b.nombre as bodega_nombre, 
-                s.estado, s.iniciada_por, s.creado_en, s.finalizado_en,
-                COUNT(r.id)::int as total_productos,
-                SUM(CASE WHEN r.decision_kalman IN ('ACEPTADA', 'CONFIRMADA_MANUAL') THEN 1 ELSE 0 END)::int as contados,
-                SUM(CASE WHEN r.decision_kalman = 'SOSPECHOSA' THEN 1 ELSE 0 END)::int as alertas
-            FROM sesiones_conteo s
-            LEFT JOIN bodegas b ON s.bodega_id = b.id
-            LEFT JOIN registros_conteo r ON s.id = r.sesion_id
-            GROUP BY s.id, b.nombre, s.estado, s.iniciada_por, s.creado_en, s.finalizado_en
-            ORDER BY s.creado_en DESC
-        """)
-        return [dict(r) for r in rows]
-```
-
-**Response esperado** (lo que el frontend consume):
-
-```json
-[
-  {
-    "id": 5,
-    "bodega_id": 1,
-    "bodega_nombre": "Bodega Cocina",
-    "estado": "finalizada",
-    "iniciada_por": "Carlos",
-    "creado_en": "2026-07-25T18:00:00Z",
-    "finalizado_en": "2026-07-25T19:30:00Z",
-    "total_productos": 287,
-    "contados": 280,
-    "alertas": 5
-  }
-]
-```
-
-#### 2. `POST /api/pending/{id}/confirmar` y `POST /api/pending/{id}/rechazar` (para botones de alertas en Reporte)
+#### `POST /api/pending/{id}/confirmar` y `POST /api/pending/{id}/rechazar` (para botones de alertas en Reporte)
 
 Hoy los botones del Reporte hacen optimistic update pero no llaman a nada. El backend necesita endpoints para confirmar/rechazar alertas SOSPECHOSA. Formato sugerido:
 
@@ -604,7 +563,7 @@ powershell -ExecutionPolicy Bypass -File scripts/center-k.ps1
 
 ### Backend (necesario para funcionalidad completa)
 
-- [ ] **`GET /api/sesiones`** — listar sesiones para `/sesiones`
+- [x] **`GET /api/sesiones`** — listar sesiones para `/sesiones`
 - [ ] **`POST /api/pending/{id}/confirmar`** — confirmar alertas en Reporte
 - [ ] **`POST /api/pending/{id}/rechazar`** — rechazar alertas en Reporte
 - [ ] **Voice list**: `GET /api/audio/voices` no se está usando, podría alimentar un selector de voz

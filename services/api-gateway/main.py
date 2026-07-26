@@ -579,7 +579,13 @@ async def query(req: QueryRequest):
     #  1) Si la query NO parece de inventario, va al modelo conversacional
     #     (B-Link via OpenRouter free). Asi el main LLM (pago) no se gasta
     #     en saludos y preguntas generales.
-    if not _is_inventory_query(text):
+    #
+    #  Excepcion: si viene pending_alert, es la resolucion de una alerta
+    #  SOSPECHOSA (la CLI/frontend responde "si"/"no"/"dale"/"cancela").
+    #  Esas palabras sueltas no matchean _INVENTORY_KEYWORDS y sin este
+    #  bypass la confirmacion caia siempre al chat conversacional y la
+    #  alerta jamas se resolvia.
+    if not req.pending_alert and not _is_inventory_query(text):
         bl_text, bl_err = await _call_conversation_model(text)
         if bl_text is not None:
             return QueryResponse(
@@ -1161,6 +1167,34 @@ class RegistroVozRequest(BaseModel):
     texto: str
 
 
+@app.get("/api/sesiones")
+async def list_sesiones():
+    """Lista todas las sesiones de conteo, ordenadas por fecha (para /sesiones)."""
+    rows = await fetch(
+        """
+        SELECT
+            s.id, s.bodega_id, b.nombre as bodega_nombre,
+            s.estado, s.iniciada_por, s.creado_en, s.finalizado_en,
+            COUNT(r.id)::int as total_productos,
+            SUM(CASE WHEN r.decision_kalman IN ('ACEPTADA', 'CONFIRMADA_MANUAL') THEN 1 ELSE 0 END)::int as contados,
+            SUM(CASE WHEN r.decision_kalman = 'SOSPECHOSA' THEN 1 ELSE 0 END)::int as alertas
+        FROM sesiones_conteo s
+        LEFT JOIN bodegas b ON s.bodega_id = b.id
+        LEFT JOIN registros_conteo r ON s.id = r.sesion_id
+        GROUP BY s.id, b.nombre, s.estado, s.iniciada_por, s.creado_en, s.finalizado_en
+        ORDER BY s.creado_en DESC
+        """
+    )
+    return [
+        {
+            **dict(row),
+            "creado_en": row["creado_en"].isoformat() if row.get("creado_en") else None,
+            "finalizado_en": row["finalizado_en"].isoformat() if row.get("finalizado_en") else None,
+        }
+        for row in rows
+    ]
+
+
 @app.post("/api/sesion/iniciar")
 async def iniciar_sesion(req: IniciarSesionRequest):
     row = await fetchrow(
@@ -1419,7 +1453,7 @@ async def reporte_diferencias(sesion_id: int):
             rc.decision_kalman
         FROM registros_conteo rc
         JOIN productos p            ON p.id = rc.producto_id
-        JOIN productos_en_bodega peb ON peb.producto_id = p.id AND peb.bodega_id = rc.bodega_id
+        JOIN productos_en_bodega peb ON peb.id = p.id AND peb.bodega_id = rc.bodega_id
         WHERE rc.sesion_id = $1
         ORDER BY ABS(rc.cantidad_normalizada - rc.stock_sistema) DESC
         """,
@@ -1436,11 +1470,11 @@ async def reporte_diferencias(sesion_id: int):
             NULL::FLOAT AS diferencia,
             'no_contado' AS decision_kalman
         FROM productos_en_bodega peb
-        JOIN productos p ON p.id = peb.producto_id
+        JOIN productos p ON p.id = peb.id
         WHERE peb.bodega_id = $1
         AND NOT EXISTS (
             SELECT 1 FROM registros_conteo rc
-            WHERE rc.producto_id = peb.producto_id
+            WHERE rc.producto_id = peb.id
               AND rc.bodega_id   = peb.bodega_id
               AND rc.sesion_id   = $2
         )
@@ -1463,6 +1497,7 @@ async def reporte_sospechosos(sesion_id: int):
     rows = await fetch(
         """
         SELECT
+            pe.id AS pending_id,
             p.nombre,
             peb.unidad,
             rc.cantidad_normalizada AS cantidad_contada,
@@ -1474,7 +1509,7 @@ async def reporte_sospechosos(sesion_id: int):
             pe.created_at
         FROM registros_conteo rc
         JOIN productos p            ON p.id = rc.producto_id
-        JOIN productos_en_bodega peb ON peb.producto_id = p.id AND peb.bodega_id = rc.bodega_id
+        JOIN productos_en_bodega peb ON peb.id = p.id AND peb.bodega_id = rc.bodega_id
         JOIN pending_evaluations pe  ON pe.id = rc.pending_id
         WHERE rc.sesion_id = $1 AND rc.decision_kalman = 'SOSPECHOSA'
         ORDER BY ABS(pe.residual) DESC
