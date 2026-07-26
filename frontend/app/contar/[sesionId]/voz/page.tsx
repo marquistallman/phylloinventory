@@ -78,8 +78,10 @@ interface RegistrarVozLLM {
 }
 
 // ─── Constantes ──────────────────────────────────────────────────────────
+//
+// Rutas relativas: las resuelve el mismo origen (dev o el dominio publico
+// detras de Cloudflare) via el rewrite de next.config.js hacia el api-gateway.
 
-const GATEWAY = process.env.NEXT_PUBLIC_API_GATEWAY_URL || "http://localhost:8200";
 const API_KEY = process.env.NEXT_PUBLIC_API_KEY || "";
 
 function authHeaders(): Record<string, string> {
@@ -253,7 +255,7 @@ export default function VozPage() {
       fd.append("file", blob, "grabacion.webm");
       fd.append("language_code", "es");
 
-      const sttRes = await fetch(`${GATEWAY}/api/audio/transcribir`, {
+      const sttRes = await fetch(`/api/audio/transcribir`, {
         method: "POST",
         body: fd,
         headers: authHeaders(),
@@ -341,7 +343,7 @@ export default function VozPage() {
       setState("responding");
 
       // TTS
-      const ttsRes = await fetch(`${GATEWAY}/api/audio/speak`, {
+      const ttsRes = await fetch(`/api/audio/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...authHeaders() },
         body: JSON.stringify({ text: narrate.text }),

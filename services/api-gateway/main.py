@@ -1161,6 +1161,34 @@ class RegistroVozRequest(BaseModel):
     texto: str
 
 
+@app.get("/api/sesiones")
+async def list_sesiones():
+    """Lista todas las sesiones de conteo, ordenadas por fecha (para /sesiones)."""
+    rows = await fetch(
+        """
+        SELECT
+            s.id, s.bodega_id, b.nombre as bodega_nombre,
+            s.estado, s.iniciada_por, s.creado_en, s.finalizado_en,
+            COUNT(r.id)::int as total_productos,
+            SUM(CASE WHEN r.decision_kalman IN ('ACEPTADA', 'CONFIRMADA_MANUAL') THEN 1 ELSE 0 END)::int as contados,
+            SUM(CASE WHEN r.decision_kalman = 'SOSPECHOSA' THEN 1 ELSE 0 END)::int as alertas
+        FROM sesiones_conteo s
+        LEFT JOIN bodegas b ON s.bodega_id = b.id
+        LEFT JOIN registros_conteo r ON s.id = r.sesion_id
+        GROUP BY s.id, b.nombre, s.estado, s.iniciada_por, s.creado_en, s.finalizado_en
+        ORDER BY s.creado_en DESC
+        """
+    )
+    return [
+        {
+            **dict(row),
+            "creado_en": row["creado_en"].isoformat() if row.get("creado_en") else None,
+            "finalizado_en": row["finalizado_en"].isoformat() if row.get("finalizado_en") else None,
+        }
+        for row in rows
+    ]
+
+
 @app.post("/api/sesion/iniciar")
 async def iniciar_sesion(req: IniciarSesionRequest):
     row = await fetchrow(

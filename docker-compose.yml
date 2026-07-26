@@ -169,9 +169,13 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # URL del api-gateway DENTRO de Docker (no localhost)
-      - NEXT_PUBLIC_API_GATEWAY_URL=http://api-gateway:8200
-      # API key (lee del .env del backend, default vacio)
+      # URL interna del api-gateway DENTRO de la red de Docker. Es una var
+      # de SERVIDOR (sin prefijo NEXT_PUBLIC_): Next.js la usa para el
+      # rewrite de /api/* y nunca llega al navegador. Se puede cambiar sin
+      # rebuildear la imagen del frontend.
+      - API_GATEWAY_INTERNAL_URL=http://api-gateway:8200
+      # API key (lee del .env del backend, default vacio). Esta si es
+      # publica: el navegador la manda como header X-API-Key.
       - NEXT_PUBLIC_API_KEY=${API_KEY:-}
     networks:
       - cactus_net
