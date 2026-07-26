@@ -3,24 +3,31 @@
 # =====================================================================
 
 # ----- Python -----
+# NOTA: estos patrones son del template estandar de Python, pero SIN barra
+# inicial matchean en cualquier profundidad. Eso rompio el build una vez:
+# "lib/" se comia "frontend/lib/" (api.ts, proxy-server.ts, demo.ts) y
+# nunca se subio a git, causando "Module not found: Can't resolve '@/lib/api'"
+# en el build del frontend recien clonado. Se anclan a la raiz (/) para que
+# solo ignoren los artefactos de setuptools/pip del proyecto Python, no
+# cualquier carpeta "lib" de otros subproyectos (frontend, etc).
 __pycache__/
 *.py[cod]
 *$py.class
 *.so
 .Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
+/build/
+/develop-eggs/
+/dist/
+/downloads/
+/eggs/
 .eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-share/python-wheels/
+/lib/
+/lib64/
+/parts/
+/sdist/
+/var/
+/wheels/
+/share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
