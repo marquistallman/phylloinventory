@@ -3,23 +3,18 @@ const nextConfig = {
   reactStrictMode: true,
   output: "standalone", // Necesario para que el Dockerfile funcione
 
-  // Proxy server-side: el browser siempre le pega a /api/* en el mismo
-  // origen (localhost:3000 en dev, o el dominio publico en prod, ej.
-  // https://app.orbit.best/api/...). Next.js reenvia esa llamada al
-  // api-gateway real usando esta URL interna, que NO viaja al navegador.
+  // NOTA: el proxy hacia el api-gateway (/api/*, /query, /inventory,
+  // /sospechosos) NO se hace aca con rewrites(). Las rewrites de Next.js
+  // se resuelven en BUILD TIME (quedan hardcodeadas en
+  // .next/routes-manifest.json dentro de la imagen), asi que un env var
+  // distinto en runtime (docker-compose, .env, etc.) nunca se aplicaba y
+  // el proxy quedaba pegado al valor default (http://localhost:8200)
+  // usado durante el build -> ECONNREFUSED en produccion/Cloudflare.
   //
-  // API_GATEWAY_INTERNAL_URL es una env var de servidor (sin prefijo
-  // NEXT_PUBLIC_), asi que se puede cambiar en runtime (docker-compose,
-  // .env, etc.) sin tener que rebuildear la imagen del frontend.
-  async rewrites() {
-    const target = process.env.API_GATEWAY_INTERNAL_URL || "http://localhost:8200";
-    return [
-      {
-        source: "/api/:path*",
-        destination: `${target}/api/:path*`,
-      },
-    ];
-  },
+  // El proxy real esta en Route Handlers (app/api/[...path]/route.ts,
+  // app/query/route.ts, app/inventory/route.ts, app/sospechosos/route.ts)
+  // que si leen process.env.API_GATEWAY_INTERNAL_URL en cada request
+  // (runtime), via el helper compartido lib/proxy-server.ts.
 };
 
 module.exports = nextConfig;

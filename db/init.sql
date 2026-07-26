@@ -472,6 +472,14 @@ BEGIN
         SET status = 'CONFIRMADA_MANUAL', resolved_at = NOW()
         WHERE id = p_pending_id;
 
+        --  Sincronizar la fila de registros_conteo de ESTE pending (si vino
+        --  de una sesion de conteo). Sin esto, el registro queda marcado
+        --  para siempre como 'SOSPECHOSA' en los reportes/filtros aunque ya
+        --  se haya confirmado manualmente.
+        UPDATE registros_conteo
+        SET decision_kalman = 'CONFIRMADA_MANUAL'
+        WHERE pending_id = p_pending_id;
+
         --  Conteo absoluto: cualquier OTRO registrar_conteo del mismo
         --  producto+bodega que siga esperando confirmacion quedo con un
         --  baseline de stock viejo (se calculo contra el stock de ANTES
@@ -501,6 +509,12 @@ BEGIN
         UPDATE pending_evaluations
         SET status = 'RECHAZADA', resolved_at = NOW()
         WHERE id = p_pending_id;
+
+        --  Idem rama de confirmacion: sincronizar registros_conteo de ESTE
+        --  pending para que deje de aparecer como alerta pendiente.
+        UPDATE registros_conteo
+        SET decision_kalman = 'RECHAZADA'
+        WHERE pending_id = p_pending_id;
 
         RETURN 'Movimiento rechazado. Stock no modificado.';
     END IF;
